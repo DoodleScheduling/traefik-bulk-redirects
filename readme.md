@@ -6,7 +6,7 @@
 [![Coverage Status](https://coveralls.io/repos/github/DoodleScheduling/traefik-plugin-bulk-redirects/badge.svg?branch=master)](https://coveralls.io/github/DoodleScheduling/traefik-plugin-bulk-redirects?branch=master)
 [![license](https://img.shields.io/github/license/DoodleScheduling/traefik-plugin-bulk-redirects.svg)](https://github.com/DoodleScheduling/traefik-plugin-bulk-redirects/blob/master/LICENSE)
 
-A Traefik middleware plugin for Cloudflare-style bulk redirects.
+A Traefik middleware plugin for Cloudflare-style bulk redirects. 
 It allows defining multiple redirects in a single Traefik Middleware configuration.
 This plugin supports exact redirects, subpath redirects, query string preservation, and configurable redirect status codes.
 
@@ -54,3 +54,4 @@ experimental:
       moduleName: github.com/DoodleScheduling/traefik-plugin-bulk-redirects
       version: v0.1.0
 ```
+
