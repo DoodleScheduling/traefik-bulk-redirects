@@ -7,7 +7,7 @@ on:
       - synchronize
       - reopened
 
-permissions: {}
+permissions: {} 
 
 jobs:
   fmt:
