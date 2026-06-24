@@ -51,7 +51,7 @@ spec:
 experimental:
   plugins:
     bulkRedirects:
-      moduleName: github.com/DoodleScheduling/traefik-plugin-bulk-redirects
+      moduleName: github.com/doodlescheduling/traefik-plugin-bulk-redirects
       version: v0.1.0
 ```
 
