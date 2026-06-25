@@ -6,7 +6,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type Config struct {
@@ -32,6 +37,15 @@ type PrefixRedirect struct {
 	Target     Target
 }
 
+var (
+	registerMetricsOnce sync.Once
+	registerMetricsErr  error
+
+	bulkRedirectsTotal    *prometheus.CounterVec
+	bulkRedirectsDuration *prometheus.HistogramVec
+	bulkRedirectsMisses   *prometheus.CounterVec
+)
+
 func CreateConfig() *Config {
 	return &Config{
 		Redirects: []Redirect{},
@@ -47,6 +61,14 @@ type BulkRedirects struct {
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	_ = ctx
+
+	registerMetricsOnce.Do(func() {
+		registerMetricsErr = registerBulkRedirectsMetrics()
+	})
+
+	if registerMetricsErr != nil {
+		return nil, registerMetricsErr
+	}
 
 	exactRedirects := make(map[string]Target, len(config.Redirects))
 	prefixRedirects := make(map[string]PrefixRedirect)
@@ -113,6 +135,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 }
 
 func (bulkRedirects *BulkRedirects) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+
 	host := normalizeHost(req.Host)
 	path := req.URL.EscapedPath()
 	if path == "" {
@@ -120,17 +144,137 @@ func (bulkRedirects *BulkRedirects) ServeHTTP(rw http.ResponseWriter, req *http.
 	}
 
 	if target, found := bulkRedirects.exactRedirects[buildKey(host, path)]; found {
+		bulkRedirects.recordRedirect("exact", target, start)
 		redirect(rw, req, target, "")
 		return
 	}
 
 	if prefixRedirect, found := bulkRedirects.findPrefixRedirect(host, path); found {
+		bulkRedirects.recordRedirect("prefix", prefixRedirect.Target, start)
+
 		suffix := strings.TrimPrefix(path, prefixRedirect.SourcePath)
 		redirect(rw, req, prefixRedirect.Target, suffix)
 		return
 	}
 
+	bulkRedirects.recordMiss()
 	bulkRedirects.next.ServeHTTP(rw, req)
+}
+
+func (bulkRedirects *BulkRedirects) recordRedirect(matchType string, target Target, start time.Time) {
+	statusCode := strconv.Itoa(target.StatusCode)
+
+	bulkRedirectsTotal.WithLabelValues(
+		bulkRedirects.name,
+		matchType,
+		statusCode,
+	).Inc()
+
+	bulkRedirectsDuration.WithLabelValues(
+		bulkRedirects.name,
+		matchType,
+		statusCode,
+	).Observe(time.Since(start).Seconds())
+}
+
+func (bulkRedirects *BulkRedirects) recordMiss() {
+	bulkRedirectsMisses.WithLabelValues(bulkRedirects.name).Inc()
+}
+
+func registerBulkRedirectsMetrics() error {
+	redirectsTotal := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "traefik_plugin_bulk_redirects_redirects_total",
+			Help: "Total redirects handled by the bulk redirects plugin.",
+		},
+		[]string{"middleware", "match_type", "status_code"},
+	)
+
+	redirectDuration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "traefik_plugin_bulk_redirects_duration_seconds",
+			Help: "Time spent by the bulk redirects plugin to match and emit a redirect.",
+			Buckets: []float64{
+				0.00001,
+				0.000025,
+				0.00005,
+				0.0001,
+				0.00025,
+				0.0005,
+				0.001,
+				0.0025,
+				0.005,
+				0.01,
+				0.025,
+				0.05,
+				0.1,
+			},
+		},
+		[]string{"middleware", "match_type", "status_code"},
+	)
+
+	misses := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "traefik_plugin_bulk_redirects_misses_total",
+			Help: "Total requests that did not match any bulk redirect rule.",
+		},
+		[]string{"middleware"},
+	)
+
+	var err error
+
+	bulkRedirectsTotal, err = registerOrReuseCounterVec(redirectsTotal)
+	if err != nil {
+		return err
+	}
+
+	bulkRedirectsDuration, err = registerOrReuseHistogramVec(redirectDuration)
+	if err != nil {
+		return err
+	}
+
+	bulkRedirectsMisses, err = registerOrReuseCounterVec(misses)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func registerOrReuseCounterVec(counter *prometheus.CounterVec) (*prometheus.CounterVec, error) {
+	err := prometheus.Register(counter)
+	if err == nil {
+		return counter, nil
+	}
+
+	if alreadyRegistered, ok := err.(prometheus.AlreadyRegisteredError); ok {
+		existing, ok := alreadyRegistered.ExistingCollector.(*prometheus.CounterVec)
+		if !ok {
+			return nil, fmt.Errorf("existing collector is not CounterVec")
+		}
+
+		return existing, nil
+	}
+
+	return nil, err
+}
+
+func registerOrReuseHistogramVec(histogram *prometheus.HistogramVec) (*prometheus.HistogramVec, error) {
+	err := prometheus.Register(histogram)
+	if err == nil {
+		return histogram, nil
+	}
+
+	if alreadyRegistered, ok := err.(prometheus.AlreadyRegisteredError); ok {
+		existing, ok := alreadyRegistered.ExistingCollector.(*prometheus.HistogramVec)
+		if !ok {
+			return nil, fmt.Errorf("existing collector is not HistogramVec")
+		}
+
+		return existing, nil
+	}
+
+	return nil, err
 }
 
 func (bulkRedirects *BulkRedirects) findPrefixRedirect(host, path string) (PrefixRedirect, bool) {
