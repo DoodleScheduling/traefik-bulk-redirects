@@ -5,7 +5,7 @@ generatorOptions:
   disableNameSuffixHash: true
 
 configMapGenerator:
-  - name: traefik-plugin-bulk-redirects
+  - name: traefik-bulk-redirects
     files:
       - ../go.mod
       - ../bulk_redirects.go

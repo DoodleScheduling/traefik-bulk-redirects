@@ -1,3 +1,3 @@
-module github.com/DoodleScheduling/traefik-plugin-bulk-redirects
+module github.com/DoodleScheduling/traefik-bulk-redirects
 
 go 1.26
