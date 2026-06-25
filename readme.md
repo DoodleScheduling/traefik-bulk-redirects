@@ -1,10 +1,10 @@
 # Traefik Plugin Bulk Redirects
 
-[![release](https://img.shields.io/github/release/DoodleScheduling/traefik-plugin-bulk-redirects/all.svg)](https://github.com/DoodleScheduling/traefik-plugin-bulk-redirects/releases)
-[![report](https://goreportcard.com/badge/github.com/DoodleScheduling/traefik-plugin-bulk-redirects)](https://goreportcard.com/report/github.com/DoodleScheduling/traefik-plugin-bulk-redirects)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/DoodleScheduling/traefik-plugin-bulk-redirects/badge)](https://api.securityscorecards.dev/projects/github.com/DoodleScheduling/traefik-plugin-bulk-redirects)
-[![Coverage Status](https://coveralls.io/repos/github/DoodleScheduling/traefik-plugin-bulk-redirects/badge.svg?branch=master)](https://coveralls.io/github/DoodleScheduling/traefik-plugin-bulk-redirects?branch=master)
-[![license](https://img.shields.io/github/license/DoodleScheduling/traefik-plugin-bulk-redirects.svg)](https://github.com/DoodleScheduling/traefik-plugin-bulk-redirects/blob/master/LICENSE)
+[![release](https://img.shields.io/github/release/DoodleScheduling/traefik-bulk-redirects/all.svg)](https://github.com/DoodleScheduling/traefik-bulk-redirects/releases)
+[![report](https://goreportcard.com/badge/github.com/DoodleScheduling/traefik-bulk-redirects)](https://goreportcard.com/report/github.com/DoodleScheduling/traefik-bulk-redirects)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/DoodleScheduling/traefik-bulk-redirects/badge)](https://api.securityscorecards.dev/projects/github.com/DoodleScheduling/traefik-bulk-redirects)
+[![Coverage Status](https://coveralls.io/repos/github/DoodleScheduling/traefik-bulk-redirects/badge.svg?branch=master)](https://coveralls.io/github/DoodleScheduling/traefik-bulk-redirects?branch=master)
+[![license](https://img.shields.io/github/license/DoodleScheduling/traefik-bulk-redirects.svg)](https://github.com/DoodleScheduling/traefik-bulk-redirects/blob/master/LICENSE)
 
 A Traefik middleware plugin for Cloudflare-style bulk redirects. 
 It allows defining multiple redirects in a single Traefik Middleware configuration.
@@ -51,7 +51,7 @@ spec:
 experimental:
   plugins:
     bulkRedirects:
-      moduleName: github.com/doodlescheduling/traefik-plugin-bulk-redirects
+      moduleName: github.com/doodlescheduling/traefik-bulk-redirects
       version: v0.1.0
 ```
 
