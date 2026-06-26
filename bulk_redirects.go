@@ -1,4 +1,4 @@
-package traefik_plugin_bulk_redirects
+package traefik_bulk_redirects
 
 import (
 	"context"
