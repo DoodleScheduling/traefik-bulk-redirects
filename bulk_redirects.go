@@ -2,11 +2,14 @@ package traefik_bulk_redirects
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 )
 
 type Config struct {
@@ -32,6 +35,17 @@ type PrefixRedirect struct {
 	Target     Target
 }
 
+type compiledRedirects struct {
+	exactRedirects  map[string]Target
+	prefixRedirects map[string]PrefixRedirect
+}
+
+var compiledCache struct {
+	sync.Mutex
+	hash     [sha256.Size]byte
+	compiled *compiledRedirects
+}
+
 func CreateConfig() *Config {
 	return &Config{
 		Redirects: []Redirect{},
@@ -39,15 +53,39 @@ func CreateConfig() *Config {
 }
 
 type BulkRedirects struct {
-	next            http.Handler
-	name            string
-	exactRedirects  map[string]Target
-	prefixRedirects map[string]PrefixRedirect
+	next     http.Handler
+	name     string
+	compiled *compiledRedirects
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	_ = ctx
 
+	hash := configHash(config)
+
+	compiledCache.Lock()
+	defer compiledCache.Unlock()
+
+	compiled := compiledCache.compiled
+	if compiled == nil || compiledCache.hash != hash {
+		var err error
+		compiled, err = compileRedirects(config)
+		if err != nil {
+			return nil, err
+		}
+
+		compiledCache.hash = hash
+		compiledCache.compiled = compiled
+	}
+
+	return &BulkRedirects{
+		next:     next,
+		name:     name,
+		compiled: compiled,
+	}, nil
+}
+
+func compileRedirects(config *Config) (*compiledRedirects, error) {
 	exactRedirects := make(map[string]Target, len(config.Redirects))
 	prefixRedirects := make(map[string]PrefixRedirect)
 
@@ -96,12 +134,44 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		exactRedirects[key] = target
 	}
 
-	return &BulkRedirects{
-		next:            next,
-		name:            name,
+	return &compiledRedirects{
 		exactRedirects:  exactRedirects,
 		prefixRedirects: prefixRedirects,
 	}, nil
+}
+
+func configHash(config *Config) [sha256.Size]byte {
+	hash := sha256.New()
+	var encoded [8]byte
+
+	writeUint64 := func(value uint64) {
+		binary.LittleEndian.PutUint64(encoded[:], value)
+		_, _ = hash.Write(encoded[:])
+	}
+	writeString := func(value string) {
+		writeUint64(uint64(len(value)))
+		_, _ = hash.Write([]byte(value))
+	}
+	writeBool := func(value bool) {
+		if value {
+			_, _ = hash.Write([]byte{1})
+			return
+		}
+		_, _ = hash.Write([]byte{0})
+	}
+
+	writeUint64(uint64(len(config.Redirects)))
+	for _, redirect := range config.Redirects {
+		writeString(redirect.SourceURL)
+		writeString(redirect.TargetURL)
+		writeUint64(uint64(redirect.StatusCode))
+		writeBool(redirect.PreserveQueryString)
+		writeBool(redirect.SubpathMatching)
+	}
+
+	var result [sha256.Size]byte
+	copy(result[:], hash.Sum(nil))
+	return result
 }
 
 func (bulkRedirects *BulkRedirects) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -111,7 +181,7 @@ func (bulkRedirects *BulkRedirects) ServeHTTP(rw http.ResponseWriter, req *http.
 		path = "/"
 	}
 
-	if target, found := bulkRedirects.exactRedirects[buildKey(host, path)]; found {
+	if target, found := bulkRedirects.compiled.exactRedirects[buildKey(host, path)]; found {
 		redirect(rw, req, target, "")
 		return
 	}
@@ -151,7 +221,7 @@ func (bulkRedirects *BulkRedirects) findPrefixRedirect(host, path string) (Prefi
 }
 
 func (bulkRedirects *BulkRedirects) findPrefixCandidate(host, path, candidate string) (PrefixRedirect, bool) {
-	if prefixRedirect, found := bulkRedirects.prefixRedirects[buildKey(host, candidate)]; found {
+	if prefixRedirect, found := bulkRedirects.compiled.prefixRedirects[buildKey(host, candidate)]; found {
 		if isSubpathMatch(path, prefixRedirect.SourcePath) {
 			return prefixRedirect, true
 		}
@@ -163,7 +233,7 @@ func (bulkRedirects *BulkRedirects) findPrefixCandidate(host, path, candidate st
 
 	alternative := toggleTrailingSlash(candidate)
 
-	if prefixRedirect, found := bulkRedirects.prefixRedirects[buildKey(host, alternative)]; found {
+	if prefixRedirect, found := bulkRedirects.compiled.prefixRedirects[buildKey(host, alternative)]; found {
 		if isSubpathMatch(path, prefixRedirect.SourcePath) {
 			return prefixRedirect, true
 		}

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -551,6 +552,188 @@ func TestIsValidRedirectStatusCode(t *testing.T) {
 			t.Fatalf("expected status code %d to be invalid", code)
 		}
 	}
+}
+
+func TestNewReusesCompiledRedirectsForEquivalentConfigs(t *testing.T) {
+	redirects := []Redirect{{
+		SourceURL:           "https://cache-reuse.example/source",
+		TargetURL:           "https://cache-reuse.example/target",
+		StatusCode:          http.StatusFound,
+		PreserveQueryString: true,
+		SubpathMatching:     true,
+	}}
+
+	first := newBulkRedirects(t, &Config{Redirects: append([]Redirect(nil), redirects...)})
+	second := newBulkRedirects(t, &Config{Redirects: append([]Redirect(nil), redirects...)})
+
+	if first.compiled != second.compiled {
+		t.Fatal("equivalent configs did not reuse compiled redirects")
+	}
+}
+
+func TestNewUsesDifferentCompiledRedirectsForDifferentConfigs(t *testing.T) {
+	first := newBulkRedirects(t, testCacheConfig("one"))
+	second := newBulkRedirects(t, testCacheConfig("two"))
+
+	if first.compiled == second.compiled {
+		t.Fatal("different configs reused compiled redirects")
+	}
+}
+
+func TestRelevantRedirectFieldsInvalidateCache(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*Redirect)
+	}{
+		{name: "source URL", change: func(r *Redirect) { r.SourceURL = "https://cache-fields.example/other" }},
+		{name: "target URL", change: func(r *Redirect) { r.TargetURL = "https://cache-fields.example/other-target" }},
+		{name: "status code", change: func(r *Redirect) { r.StatusCode = http.StatusTemporaryRedirect }},
+		{name: "preserve query string", change: func(r *Redirect) { r.PreserveQueryString = !r.PreserveQueryString }},
+		{name: "subpath matching", change: func(r *Redirect) { r.SubpathMatching = !r.SubpathMatching }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := testCacheConfig("fields")
+			changed := testCacheConfig("fields")
+			tt.change(&changed.Redirects[0])
+
+			first := newBulkRedirects(t, original)
+			second := newBulkRedirects(t, changed)
+			if first.compiled == second.compiled {
+				t.Fatal("changed redirect field did not invalidate cache")
+			}
+		})
+	}
+}
+
+func TestRedirectOrderAffectsCacheIdentity(t *testing.T) {
+	firstRedirect := testCacheConfig("order-one").Redirects[0]
+	secondRedirect := testCacheConfig("order-two").Redirects[0]
+	firstConfig := &Config{Redirects: []Redirect{firstRedirect, secondRedirect}}
+	secondConfig := &Config{Redirects: []Redirect{secondRedirect, firstRedirect}}
+
+	if configHash(firstConfig) == configHash(secondConfig) {
+		t.Fatal("redirect order did not affect config hash")
+	}
+
+	first := newBulkRedirects(t, firstConfig)
+	second := newBulkRedirects(t, secondConfig)
+	if first.compiled == second.compiled {
+		t.Fatal("redirect order did not invalidate cache")
+	}
+}
+
+func TestPreviouslyCompiledRedirectsRemainValidAfterCacheReplacement(t *testing.T) {
+	oldHandler := newBulkRedirects(t, testCacheConfig("old"))
+	oldCompiled := oldHandler.compiled
+	newHandler := newBulkRedirects(t, testCacheConfig("new"))
+
+	if oldCompiled == newHandler.compiled {
+		t.Fatal("new config reused old compiled redirects")
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://cache-old.example/source", nil)
+	oldHandler.ServeHTTP(rec, req)
+	assertStatus(t, rec, http.StatusFound)
+	assertLocation(t, rec, "https://cache-old.example/target")
+}
+
+func TestConcurrentNewReusesCompiledRedirects(t *testing.T) {
+	const goroutines = 100
+	config := testCacheConfig("concurrent-new")
+	compiled := make(chan *compiledRedirects, goroutines)
+	errs := make(chan error, goroutines)
+
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			handler, err := New(context.Background(), nextHandler(), config, "different-name")
+			if err != nil {
+				errs <- err
+				return
+			}
+			compiled <- handler.(*BulkRedirects).compiled
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	close(compiled)
+
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	var expected *compiledRedirects
+	for current := range compiled {
+		if expected == nil {
+			expected = current
+			continue
+		}
+		if current != expected {
+			t.Fatal("concurrent New calls did not reuse compiled redirects")
+		}
+	}
+}
+
+func TestConcurrentServeHTTPWithSharedCompiledRedirects(t *testing.T) {
+	const goroutines = 100
+	first := newBulkRedirects(t, testCacheConfig("concurrent-serve"))
+	second := newBulkRedirects(t, testCacheConfig("concurrent-serve"))
+	if first.compiled != second.compiled {
+		t.Fatal("handlers do not share compiled redirects")
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan string, goroutines)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			handler := first
+			if index%2 == 1 {
+				handler = second
+			}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "https://cache-concurrent-serve.example/source?q=1", nil)
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusFound {
+				errs <- "unexpected status"
+			}
+			if rec.Header().Get("Location") != "https://cache-concurrent-serve.example/target?q=1" {
+				errs <- "unexpected location"
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func testCacheConfig(id string) *Config {
+	return &Config{Redirects: []Redirect{{
+		SourceURL:           "https://cache-" + id + ".example/source",
+		TargetURL:           "https://cache-" + id + ".example/target",
+		StatusCode:          http.StatusFound,
+		PreserveQueryString: true,
+		SubpathMatching:     false,
+	}}}
+}
+
+func newBulkRedirects(t *testing.T, config *Config) *BulkRedirects {
+	t.Helper()
+
+	handler, err := New(context.Background(), nextHandler(), config, "bulk-redirects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handler.(*BulkRedirects)
 }
 
 func newTestHandler(t *testing.T, redirects []Redirect) http.Handler {
