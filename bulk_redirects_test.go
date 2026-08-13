@@ -2,8 +2,14 @@ package traefik_bulk_redirects
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -555,6 +561,8 @@ func TestIsValidRedirectStatusCode(t *testing.T) {
 }
 
 func TestNewReusesCompiledRedirectsForEquivalentConfigs(t *testing.T) {
+	resetCaches()
+
 	redirects := []Redirect{{
 		SourceURL:           "https://cache-reuse.example/source",
 		TargetURL:           "https://cache-reuse.example/target",
@@ -568,6 +576,18 @@ func TestNewReusesCompiledRedirectsForEquivalentConfigs(t *testing.T) {
 
 	if first.compiled != second.compiled {
 		t.Fatal("equivalent configs did not reuse compiled redirects")
+	}
+}
+
+func TestNewWithSameConfigPointerReusesCompiledRedirects(t *testing.T) {
+	resetCaches()
+	config := testCacheConfig("same-pointer")
+
+	first := newBulkRedirects(t, config)
+	second := newBulkRedirects(t, config)
+
+	if first.compiled != second.compiled {
+		t.Fatal("same config pointer did not reuse compiled redirects")
 	}
 }
 
@@ -624,6 +644,114 @@ func TestRedirectOrderAffectsCacheIdentity(t *testing.T) {
 	}
 }
 
+func TestConfigHashEquivalentConfigsMatch(t *testing.T) {
+	first := testCacheConfig("equivalent-hash")
+	second := &Config{Redirects: append([]Redirect(nil), first.Redirects...)}
+
+	if configHash(first) != configHash(second) {
+		t.Fatal("equivalent configs produced different hashes")
+	}
+}
+
+func TestConfigHashIncludesEveryRedirectField(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*Redirect)
+	}{
+		{name: "source URL", change: func(r *Redirect) { r.SourceURL += "/changed" }},
+		{name: "target URL", change: func(r *Redirect) { r.TargetURL += "/changed" }},
+		{name: "status code", change: func(r *Redirect) { r.StatusCode = http.StatusTemporaryRedirect }},
+		{name: "preserve query string", change: func(r *Redirect) { r.PreserveQueryString = !r.PreserveQueryString }},
+		{name: "subpath matching", change: func(r *Redirect) { r.SubpathMatching = !r.SubpathMatching }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := testCacheConfig("hash-fields")
+			changed := &Config{Redirects: append([]Redirect(nil), original.Redirects...)}
+			tt.change(&changed.Redirects[0])
+
+			if configHash(original) == configHash(changed) {
+				t.Fatal("changed field did not affect config hash")
+			}
+		})
+	}
+}
+
+func TestConfigHashDetectsChangeInMiddleRedirect(t *testing.T) {
+	original := benchmarkConfig(5)
+	changed := &Config{Redirects: append([]Redirect(nil), original.Redirects...)}
+	changed.Redirects[len(changed.Redirects)/2].TargetURL += "/changed"
+
+	if configHash(original) == configHash(changed) {
+		t.Fatal("changed middle redirect did not affect config hash")
+	}
+}
+
+func TestConfigHashFramesStringsByLength(t *testing.T) {
+	first := &Config{Redirects: []Redirect{{SourceURL: "a", TargetURL: "bc"}}}
+	second := &Config{Redirects: []Redirect{{SourceURL: "ab", TargetURL: "c"}}}
+
+	if configHash(first) == configHash(second) {
+		t.Fatal("differently framed strings produced the same hash")
+	}
+}
+
+func TestConfigHashMatchesPreviousSerialization(t *testing.T) {
+	config := &Config{Redirects: []Redirect{
+		{
+			SourceURL:           "https://example.com/" + strings.Repeat("long-source/", 40),
+			TargetURL:           "https://example.com/" + strings.Repeat("long-target/", 40),
+			StatusCode:          http.StatusPermanentRedirect,
+			PreserveQueryString: true,
+			SubpathMatching:     true,
+		},
+		{
+			SourceURL:  "",
+			TargetURL:  "",
+			StatusCode: 0,
+		},
+	}}
+
+	if got, expected := configHash(config), previousConfigHash(config); got != expected {
+		t.Fatalf("optimized hash %x differs from previous hash %x", got, expected)
+	}
+}
+
+func previousConfigHash(config *Config) [sha256.Size]byte {
+	hash := sha256.New()
+	var encoded [8]byte
+
+	writeUint64 := func(value uint64) {
+		binary.LittleEndian.PutUint64(encoded[:], value)
+		_, _ = hash.Write(encoded[:])
+	}
+	writeString := func(value string) {
+		writeUint64(uint64(len(value)))
+		_, _ = hash.Write([]byte(value))
+	}
+	writeBool := func(value bool) {
+		if value {
+			_, _ = hash.Write([]byte{1})
+			return
+		}
+		_, _ = hash.Write([]byte{0})
+	}
+
+	writeUint64(uint64(len(config.Redirects)))
+	for _, redirect := range config.Redirects {
+		writeString(redirect.SourceURL)
+		writeString(redirect.TargetURL)
+		writeUint64(uint64(redirect.StatusCode))
+		writeBool(redirect.PreserveQueryString)
+		writeBool(redirect.SubpathMatching)
+	}
+
+	var result [sha256.Size]byte
+	copy(result[:], hash.Sum(nil))
+	return result
+}
+
 func TestPreviouslyCompiledRedirectsRemainValidAfterCacheReplacement(t *testing.T) {
 	oldHandler := newBulkRedirects(t, testCacheConfig("old"))
 	oldCompiled := oldHandler.compiled
@@ -641,6 +769,8 @@ func TestPreviouslyCompiledRedirectsRemainValidAfterCacheReplacement(t *testing.
 }
 
 func TestConcurrentNewReusesCompiledRedirects(t *testing.T) {
+	resetCaches()
+
 	const goroutines = 100
 	config := testCacheConfig("concurrent-new")
 	compiled := make(chan *compiledRedirects, goroutines)
@@ -677,6 +807,7 @@ func TestConcurrentNewReusesCompiledRedirects(t *testing.T) {
 			t.Fatal("concurrent New calls did not reuse compiled redirects")
 		}
 	}
+
 }
 
 func TestConcurrentServeHTTPWithSharedCompiledRedirects(t *testing.T) {
@@ -716,6 +847,402 @@ func TestConcurrentServeHTTPWithSharedCompiledRedirects(t *testing.T) {
 	}
 }
 
+func TestInlineModesRemainBackwardsCompatible(t *testing.T) {
+	for _, mode := range []string{"", modeInline} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			resetCaches()
+			config := testCacheConfig("inline-" + mode)
+			config.Mode = mode
+			handler := newBulkRedirects(t, config)
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, config.Redirects[0].SourceURL+"?q=1", nil)
+			handler.ServeHTTP(rec, req)
+			assertStatus(t, rec, http.StatusFound)
+			assertLocation(t, rec, config.Redirects[0].TargetURL+"?q=1")
+		})
+	}
+}
+
+func TestNewValidatesConfigurationMode(t *testing.T) {
+	validChecksum := "sha256:" + strings.Repeat("0", sha256.Size*2)
+	tests := []struct {
+		name     string
+		config   *Config
+		expected string
+	}{
+		{name: "unknown mode", config: &Config{Mode: "unknown"}, expected: `unsupported bulk redirects mode "unknown"`},
+		{name: "inline file path", config: &Config{FilePath: "/redirects.json"}, expected: "filePath/fileChecksum cannot be configured in inline mode"},
+		{name: "inline checksum", config: &Config{Mode: modeInline, FileChecksum: validChecksum}, expected: "filePath/fileChecksum cannot be configured in inline mode"},
+		{name: "file redirects", config: &Config{Mode: modeFile, Redirects: []Redirect{{}}, FilePath: "/redirects.json", FileChecksum: validChecksum}, expected: `redirects cannot be configured inline when mode is "file"`},
+		{name: "file path missing", config: &Config{Mode: modeFile, FileChecksum: validChecksum}, expected: "filePath is required in file mode"},
+		{name: "relative file path", config: &Config{Mode: modeFile, FilePath: "redirects.json", FileChecksum: validChecksum}, expected: "filePath must be absolute in file mode"},
+		{name: "checksum missing", config: &Config{Mode: modeFile, FilePath: "/redirects.json"}, expected: "fileChecksum is required in file mode"},
+		{name: "checksum short", config: &Config{Mode: modeFile, FilePath: "/redirects.json", FileChecksum: "sha256:1234"}, expected: "invalid fileChecksum"},
+		{name: "checksum uppercase", config: &Config{Mode: modeFile, FilePath: "/redirects.json", FileChecksum: "sha256:" + strings.Repeat("A", sha256.Size*2)}, expected: "invalid fileChecksum"},
+		{name: "checksum non hexadecimal", config: &Config{Mode: modeFile, FilePath: "/redirects.json", FileChecksum: "sha256:" + strings.Repeat("z", sha256.Size*2)}, expected: "invalid fileChecksum"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(context.Background(), nextHandler(), tt.config, "bulk-redirects")
+			assertErrorContains(t, err, tt.expected)
+		})
+	}
+}
+
+func TestFileModeReadChecksumAndJSONErrors(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		resetCaches()
+		path := filepath.Join(t.TempDir(), "missing.json")
+		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksumForBytes(nil)), "bulk-redirects")
+		assertErrorContains(t, err, "unable to read redirects file")
+	})
+
+	t.Run("checksum mismatch", func(t *testing.T) {
+		resetCaches()
+		path := filepath.Join(t.TempDir(), "redirects.json")
+		if err := os.WriteFile(path, []byte(`{"redirects":[]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksumForBytes([]byte("different"))), "bulk-redirects")
+		assertErrorContains(t, err, "checksum mismatch for redirects file")
+		assertErrorContains(t, err, "expected sha256:")
+		if strings.Contains(err.Error(), "got sha256:") {
+			t.Fatalf("checksum mismatch exposed calculated checksum: %v", err)
+		}
+	})
+
+	t.Run("invalid JSON", func(t *testing.T) {
+		resetCaches()
+		path, checksum := writeRedirectBytes(t, []byte(`{"redirects":`))
+		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksum), "bulk-redirects")
+		assertErrorContains(t, err, "unable to decode redirects file")
+	})
+
+	t.Run("unknown file field", func(t *testing.T) {
+		resetCaches()
+		path, checksum := writeRedirectBytes(t, []byte(`{"redirects":[],"mode":"inline"}`))
+		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksum), "bulk-redirects")
+		assertErrorContains(t, err, "unable to decode redirects file")
+	})
+
+	t.Run("invalid redirect", func(t *testing.T) {
+		resetCaches()
+		path, checksum := writeRedirectFile(t, []Redirect{{TargetURL: "https://example.com/target"}})
+		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksum), "bulk-redirects")
+		assertErrorContains(t, err, "invalid redirect in file")
+		assertErrorContains(t, err, "sourceURL is required")
+	})
+}
+
+func TestReadRulesFileSizeLimit(t *testing.T) {
+	t.Run("exact maximum size", func(t *testing.T) {
+		path := writeSizedFile(t, maxRulesFileSize)
+		fileBytes, err := readRulesFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(fileBytes) != maxRulesFileSize {
+			t.Fatalf("expected %d bytes, got %d", maxRulesFileSize, len(fileBytes))
+		}
+	})
+
+	t.Run("maximum size plus one", func(t *testing.T) {
+		path := writeSizedFile(t, maxRulesFileSize+1)
+		_, err := readRulesFile(path)
+		assertErrorContains(t, err, path)
+		assertErrorContains(t, err, "exceeds maximum size of 16777216 bytes")
+	})
+}
+
+func TestReadRulesFileRejectsNonRegularFile(t *testing.T) {
+	path := t.TempDir()
+	_, err := readRulesFile(path)
+	assertErrorContains(t, err, `redirects file "`+path+`" is not a regular file`)
+}
+
+func TestFileModeRedirectBehavior(t *testing.T) {
+	resetCaches()
+	path, checksum := writeRedirectFile(t, []Redirect{
+		{
+			SourceURL:           "https://file.example/exact",
+			TargetURL:           "https://file.example/exact-target",
+			StatusCode:          http.StatusFound,
+			PreserveQueryString: true,
+		},
+		{
+			SourceURL:           "https://file.example/docs",
+			TargetURL:           "https://file.example/resources",
+			StatusCode:          http.StatusMovedPermanently,
+			PreserveQueryString: true,
+			SubpathMatching:     true,
+		},
+	})
+	handler := newBulkRedirects(t, fileConfig(path, checksum))
+
+	tests := []struct {
+		name     string
+		url      string
+		status   int
+		location string
+	}{
+		{name: "exact", url: "https://file.example/exact?q=1", status: http.StatusFound, location: "https://file.example/exact-target?q=1"},
+		{name: "prefix", url: "https://file.example/docs/api?q=1", status: http.StatusMovedPermanently, location: "https://file.example/resources/api?q=1"},
+		{name: "pass through", url: "https://file.example/unmatched", status: http.StatusTeapot},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, tt.url, nil)
+			handler.ServeHTTP(rec, req)
+			assertStatus(t, rec, tt.status)
+			if tt.location != "" {
+				assertLocation(t, rec, tt.location)
+			}
+		})
+	}
+}
+
+func TestFileModeCacheHitDoesNotReadFileAgain(t *testing.T) {
+	resetCaches()
+	path, checksum := writeRedirectFile(t, testCacheConfig("file-cache").Redirects)
+	first := newBulkRedirects(t, fileConfig(path, checksum))
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	second := newBulkRedirects(t, fileConfig(path, checksum))
+
+	if first.compiled != second.compiled {
+		t.Fatal("same file cache key did not reuse compiled redirects")
+	}
+}
+
+func TestFileModeNewChecksumLoadsNewVersionAndKeepsOldHandlerValid(t *testing.T) {
+	resetCaches()
+	path, checksumA := writeRedirectFile(t, testCacheConfig("version-a").Redirects)
+	handlerA := newBulkRedirects(t, fileConfig(path, checksumA))
+
+	redirectsB := testCacheConfig("version-b").Redirects
+	checksumB := overwriteRedirectFile(t, path, redirectsB)
+	handlerB := newBulkRedirects(t, fileConfig(path, checksumB))
+	if handlerA.compiled == handlerB.compiled {
+		t.Fatal("new checksum reused previous compiled redirects")
+	}
+
+	assertHandlerRedirect(t, handlerA, "https://cache-version-a.example/source", "https://cache-version-a.example/target")
+	assertHandlerRedirect(t, handlerB, "https://cache-version-b.example/source", "https://cache-version-b.example/target")
+}
+
+func TestFailedFileVersionDoesNotReplaceValidCache(t *testing.T) {
+	resetCaches()
+	path, checksumA := writeRedirectFile(t, testCacheConfig("valid-version").Redirects)
+	handlerA := newBulkRedirects(t, fileConfig(path, checksumA))
+
+	badBytes := []byte(`{"redirects":`)
+	if err := os.WriteFile(path, badBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(context.Background(), nextHandler(), fileConfig(path, checksumForBytes(badBytes)), "bulk-redirects")
+	assertErrorContains(t, err, "unable to decode redirects file")
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	cachedA := newBulkRedirects(t, fileConfig(path, checksumA))
+	if handlerA.compiled != cachedA.compiled {
+		t.Fatal("failed version replaced valid cached version")
+	}
+	assertHandlerRedirect(t, handlerA, "https://cache-valid-version.example/source", "https://cache-valid-version.example/target")
+}
+
+func TestOversizedFileDoesNotReplaceValidCache(t *testing.T) {
+	resetCaches()
+	path, checksumA := writeRedirectFile(t, testCacheConfig("valid-before-oversized").Redirects)
+	handlerA := newBulkRedirects(t, fileConfig(path, checksumA))
+
+	if err := os.Truncate(path, int64(maxRulesFileSize)+1); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(
+		context.Background(),
+		nextHandler(),
+		fileConfig(path, "sha256:"+strings.Repeat("0", sha256.Size*2)),
+		"bulk-redirects",
+	)
+	assertErrorContains(t, err, "exceeds maximum size of 16777216 bytes")
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	cachedA := newBulkRedirects(t, fileConfig(path, checksumA))
+	if handlerA.compiled != cachedA.compiled {
+		t.Fatal("oversized version replaced valid cached version")
+	}
+	assertHandlerRedirect(
+		t,
+		handlerA,
+		"https://cache-valid-before-oversized.example/source",
+		"https://cache-valid-before-oversized.example/target",
+	)
+}
+
+func TestConcurrentNewWithFileCacheKeyReusesCompiledRedirects(t *testing.T) {
+	resetCaches()
+	path, checksum := writeRedirectFile(t, testCacheConfig("concurrent-file").Redirects)
+
+	const goroutines = 100
+	results := make(chan *compiledRedirects, goroutines)
+	errs := make(chan error, goroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			handler, err := New(context.Background(), nextHandler(), fileConfig(path, checksum), "bulk-redirects")
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- handler.(*BulkRedirects).compiled
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatal(err)
+	}
+	var expected *compiledRedirects
+	for compiled := range results {
+		if expected == nil {
+			expected = compiled
+		} else if compiled != expected {
+			t.Fatal("concurrent file New calls did not share compiled redirects")
+		}
+	}
+}
+
+func TestConcurrentServeHTTPWithSharedFileCompiledRedirects(t *testing.T) {
+	resetCaches()
+	path, checksum := writeRedirectFile(t, testCacheConfig("file-serve").Redirects)
+	first := newBulkRedirects(t, fileConfig(path, checksum))
+	second := newBulkRedirects(t, fileConfig(path, checksum))
+
+	const goroutines = 100
+	errs := make(chan string, goroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			handler := first
+			if index%2 == 1 {
+				handler = second
+			}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "https://cache-file-serve.example/source?q=1", nil)
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusFound || rec.Header().Get("Location") != "https://cache-file-serve.example/target?q=1" {
+				errs <- "unexpected file redirect response"
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func TestFileCacheIsBoundedAndEvictionKeepsOldHandlersValid(t *testing.T) {
+	resetCaches()
+	var firstHandler *BulkRedirects
+	for i := 0; i < maxFileCacheEntries+2; i++ {
+		id := string(rune('a' + i))
+		path, checksum := writeRedirectFile(t, testCacheConfig("eviction-"+id).Redirects)
+		handler := newBulkRedirects(t, fileConfig(path, checksum))
+		if i == 0 {
+			firstHandler = handler
+		}
+	}
+
+	fileCache.Lock()
+	cacheSize := len(fileCache.entries)
+	fileCache.Unlock()
+	if cacheSize != maxFileCacheEntries {
+		t.Fatalf("expected file cache size %d, got %d", maxFileCacheEntries, cacheSize)
+	}
+	assertHandlerRedirect(t, firstHandler, "https://cache-eviction-a.example/source", "https://cache-eviction-a.example/target")
+}
+
+func fileConfig(path, checksum string) *Config {
+	return &Config{Mode: modeFile, FilePath: path, FileChecksum: checksum}
+}
+
+func writeRedirectFile(t *testing.T, redirects []Redirect) (string, string) {
+	t.Helper()
+	fileBytes, err := json.Marshal(fileRedirects{Redirects: redirects})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return writeRedirectBytes(t, fileBytes)
+}
+
+func writeRedirectBytes(t *testing.T, fileBytes []byte) (string, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "redirects.json")
+	if err := os.WriteFile(path, fileBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, checksumForBytes(fileBytes)
+}
+
+func overwriteRedirectFile(t *testing.T, path string, redirects []Redirect) string {
+	t.Helper()
+	fileBytes, err := json.Marshal(fileRedirects{Redirects: redirects})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, fileBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return checksumForBytes(fileBytes)
+}
+
+func checksumForBytes(fileBytes []byte) string {
+	checksum := sha256.Sum256(fileBytes)
+	return "sha256:" + hex.EncodeToString(checksum[:])
+}
+
+func writeSizedFile(t *testing.T, size int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "redirects.json")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(int64(size)); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func assertHandlerRedirect(t *testing.T, handler http.Handler, sourceURL, targetURL string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, sourceURL, nil)
+	handler.ServeHTTP(rec, req)
+	assertStatus(t, rec, http.StatusFound)
+	assertLocation(t, rec, targetURL)
+}
+
 func testCacheConfig(id string) *Config {
 	return &Config{Redirects: []Redirect{{
 		SourceURL:           "https://cache-" + id + ".example/source",
@@ -734,6 +1261,23 @@ func newBulkRedirects(t *testing.T, config *Config) *BulkRedirects {
 		t.Fatal(err)
 	}
 	return handler.(*BulkRedirects)
+}
+
+func resetCaches() {
+	inlineCache.Lock()
+	inlineCache.config = nil
+	inlineCache.hash = [sha256.Size]byte{}
+	inlineCache.compiled = nil
+	inlineCache.Unlock()
+
+	resetFileCache()
+}
+
+func resetFileCache() {
+	fileCache.Lock()
+	fileCache.entries = make(map[fileCacheKey]*compiledRedirects)
+	fileCache.order = nil
+	fileCache.Unlock()
 }
 
 func newTestHandler(t *testing.T, redirects []Redirect) http.Handler {

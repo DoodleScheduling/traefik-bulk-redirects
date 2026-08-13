@@ -1,19 +1,27 @@
 package traefik_bulk_redirects
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
 
 type Config struct {
-	Redirects []Redirect `json:"redirects,omitempty"`
+	Mode         string     `json:"mode,omitempty"`
+	Redirects    []Redirect `json:"redirects,omitempty"`
+	FilePath     string     `json:"filePath,omitempty"`
+	FileChecksum string     `json:"fileChecksum,omitempty"`
 }
 
 type Redirect struct {
@@ -40,10 +48,31 @@ type compiledRedirects struct {
 	prefixRedirects map[string]PrefixRedirect
 }
 
-var compiledCache struct {
+const (
+	modeInline          = "inline"
+	modeFile            = "file"
+	maxFileCacheEntries = 8
+	maxRulesFileSize    = 16 << 20
+)
+
+var inlineCache struct {
 	sync.Mutex
+	config   *Config
 	hash     [sha256.Size]byte
 	compiled *compiledRedirects
+}
+
+type fileCacheKey struct {
+	path     string
+	checksum string
+}
+
+var fileCache = struct {
+	sync.Mutex
+	entries map[fileCacheKey]*compiledRedirects
+	order   []fileCacheKey
+}{
+	entries: make(map[fileCacheKey]*compiledRedirects),
 }
 
 func CreateConfig() *Config {
@@ -61,35 +90,228 @@ type BulkRedirects struct {
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	_ = ctx
 
-	hash := configHash(config)
+	switch config.Mode {
+	case "", modeInline:
+		if config.FilePath != "" || config.FileChecksum != "" {
+			return nil, fmt.Errorf("filePath/fileChecksum cannot be configured in inline mode")
+		}
 
-	compiledCache.Lock()
-	defer compiledCache.Unlock()
-
-	compiled := compiledCache.compiled
-	if compiled == nil || compiledCache.hash != hash {
-		var err error
-		compiled, err = compileRedirects(config)
+		compiled, err := loadInlineRedirects(config)
 		if err != nil {
 			return nil, err
 		}
+		return newHandler(next, name, compiled), nil
 
-		compiledCache.hash = hash
-		compiledCache.compiled = compiled
+	case modeFile:
+		compiled, err := loadFileRedirects(config)
+		if err != nil {
+			return nil, err
+		}
+		return newHandler(next, name, compiled), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported bulk redirects mode %q", config.Mode)
+	}
+}
+
+func loadInlineRedirects(config *Config) (*compiledRedirects, error) {
+	inlineCache.Lock()
+	defer inlineCache.Unlock()
+
+	if inlineCache.compiled != nil && inlineCache.config == config {
+		return inlineCache.compiled, nil
 	}
 
+	hash := configHash(config)
+	if inlineCache.compiled != nil && inlineCache.hash == hash {
+		inlineCache.config = config
+		return inlineCache.compiled, nil
+	}
+
+	compiled, err := compileRedirects(config.Redirects)
+	if err != nil {
+		return nil, err
+	}
+
+	inlineCache.hash = hash
+	inlineCache.compiled = compiled
+	inlineCache.config = config
+
+	return compiled, nil
+}
+
+type fileRedirects struct {
+	Redirects []Redirect `json:"redirects"`
+}
+
+func loadFileRedirects(config *Config) (*compiledRedirects, error) {
+	if len(config.Redirects) != 0 {
+		return nil, fmt.Errorf("redirects cannot be configured inline when mode is %q", modeFile)
+	}
+	if config.FilePath == "" {
+		return nil, fmt.Errorf("filePath is required in file mode")
+	}
+	if !filepath.IsAbs(config.FilePath) {
+		return nil, fmt.Errorf("filePath must be absolute in file mode, got %q", config.FilePath)
+	}
+	if config.FileChecksum == "" {
+		return nil, fmt.Errorf("fileChecksum is required in file mode")
+	}
+
+	expectedChecksum, canonicalChecksum, err := parseFileChecksum(config.FileChecksum)
+	if err != nil {
+		return nil, err
+	}
+
+	key := fileCacheKey{path: config.FilePath, checksum: canonicalChecksum}
+	fileCache.Lock()
+	defer fileCache.Unlock()
+
+	if compiled, found := fileCache.entries[key]; found {
+		return compiled, nil
+	}
+
+	fileBytes, err := readRulesFile(config.FilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	actualChecksum := sha256.Sum256(fileBytes)
+	if actualChecksum != expectedChecksum {
+		return nil, fmt.Errorf("checksum mismatch for redirects file %q: expected %s", config.FilePath, canonicalChecksum)
+	}
+
+	redirectFile, err := decodeRedirectsFile(fileBytes)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode redirects file %q: %w", config.FilePath, err)
+	}
+
+	compiled, err := compileRedirects(redirectFile.Redirects)
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirect in file %q: %w", config.FilePath, err)
+	}
+
+	if len(fileCache.order) == maxFileCacheEntries {
+		delete(fileCache.entries, fileCache.order[0])
+		fileCache.order = fileCache.order[1:]
+	}
+	fileCache.entries[key] = compiled
+	fileCache.order = append(fileCache.order, key)
+
+	return compiled, nil
+}
+
+func readRulesFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read redirects file %q: %w", path, err)
+	}
+	if err := validateRulesFileInfo(path, info); err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read redirects file %q: %w", path, err)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	info, err = file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("unable to stat redirects file %q: %w", path, err)
+	}
+	if err := validateRulesFileInfo(path, info); err != nil {
+		return nil, err
+	}
+
+	fileBytes, err := io.ReadAll(io.LimitReader(file, int64(maxRulesFileSize)+1))
+	if err != nil {
+		return nil, fmt.Errorf("unable to read redirects file %q: %w", path, err)
+	}
+	if len(fileBytes) > maxRulesFileSize {
+		return nil, fmt.Errorf("redirects file %q exceeds maximum size of %d bytes", path, maxRulesFileSize)
+	}
+
+	return fileBytes, nil
+}
+
+func validateRulesFileInfo(path string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("redirects file %q is not a regular file", path)
+	}
+	if info.Size() > int64(maxRulesFileSize) {
+		return fmt.Errorf("redirects file %q exceeds maximum size of %d bytes", path, maxRulesFileSize)
+	}
+	return nil
+}
+
+func parseFileChecksum(value string) ([sha256.Size]byte, string, error) {
+	const prefix = "sha256:"
+	var checksum [sha256.Size]byte
+
+	if len(value) != len(prefix)+sha256.Size*2 || !strings.HasPrefix(value, prefix) {
+		return checksum, "", fmt.Errorf("invalid fileChecksum %q: expected sha256:<64 lowercase hexadecimal characters>", value)
+	}
+
+	encoded := value[len(prefix):]
+	for i := range checksum {
+		high, highValid := lowercaseHexValue(encoded[i*2])
+		low, lowValid := lowercaseHexValue(encoded[i*2+1])
+		if !highValid || !lowValid {
+			return checksum, "", fmt.Errorf("invalid fileChecksum %q: expected sha256:<64 lowercase hexadecimal characters>", value)
+		}
+		checksum[i] = high<<4 | low
+	}
+
+	return checksum, value, nil
+}
+
+func lowercaseHexValue(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func decodeRedirectsFile(fileBytes []byte) (*fileRedirects, error) {
+	decoder := json.NewDecoder(bytes.NewReader(fileBytes))
+	decoder.DisallowUnknownFields()
+
+	var redirects fileRedirects
+	if err := decoder.Decode(&redirects); err != nil {
+		return nil, err
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("multiple JSON values are not allowed")
+		}
+		return nil, err
+	}
+
+	return &redirects, nil
+}
+
+func newHandler(next http.Handler, name string, compiled *compiledRedirects) *BulkRedirects {
 	return &BulkRedirects{
 		next:     next,
 		name:     name,
 		compiled: compiled,
-	}, nil
+	}
 }
 
-func compileRedirects(config *Config) (*compiledRedirects, error) {
-	exactRedirects := make(map[string]Target, len(config.Redirects))
+func compileRedirects(redirects []Redirect) (*compiledRedirects, error) {
+	exactRedirects := make(map[string]Target, len(redirects))
 	prefixRedirects := make(map[string]PrefixRedirect)
 
-	for _, redirect := range config.Redirects {
+	for _, redirect := range redirects {
 		if redirect.StatusCode == 0 {
 			redirect.StatusCode = http.StatusMovedPermanently
 		}
@@ -143,6 +365,8 @@ func compileRedirects(config *Config) (*compiledRedirects, error) {
 func configHash(config *Config) [sha256.Size]byte {
 	hash := sha256.New()
 	var encoded [8]byte
+	var stringBuffer [256]byte
+	var boolBuffer [1]byte
 
 	writeUint64 := func(value uint64) {
 		binary.LittleEndian.PutUint64(encoded[:], value)
@@ -150,14 +374,19 @@ func configHash(config *Config) [sha256.Size]byte {
 	}
 	writeString := func(value string) {
 		writeUint64(uint64(len(value)))
-		_, _ = hash.Write([]byte(value))
+		for len(value) > 0 {
+			written := copy(stringBuffer[:], value)
+			_, _ = hash.Write(stringBuffer[:written])
+			value = value[written:]
+		}
 	}
 	writeBool := func(value bool) {
 		if value {
-			_, _ = hash.Write([]byte{1})
-			return
+			boolBuffer[0] = 1
+		} else {
+			boolBuffer[0] = 0
 		}
-		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write(boolBuffer[:])
 	}
 
 	writeUint64(uint64(len(config.Redirects)))
@@ -170,7 +399,7 @@ func configHash(config *Config) [sha256.Size]byte {
 	}
 
 	var result [sha256.Size]byte
-	copy(result[:], hash.Sum(nil))
+	hash.Sum(result[:0])
 	return result
 }
 
