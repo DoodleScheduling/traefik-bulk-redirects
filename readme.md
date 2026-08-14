@@ -57,7 +57,9 @@ Inline mode is simple, but Traefik must decode the complete redirect list for ev
 
 ## File mode
 
-File mode loads redirects from a JSON file mounted in the Traefik container. The first `New()` call for a new `filePath` reads, decodes, validates and compiles the file. Later instances with the same path reuse the immutable compiled rules without filesystem I/O, parsing, validation or compilation.
+File mode loads redirects from a JSON file mounted in the Traefik container. The first `New()` call for a new `filePath` reads, decodes, validates and compiles the file. Compiled file-based rulesets are cached by file path for the lifetime of the Traefik process. Subsequent middleware instances using that path reuse the exact compiled ruleset from memory. Cached middleware construction performs no filesystem reads or stats, hashing, JSON decoding, redirect validation or recompilation.
+
+File contents are considered immutable for the lifetime of the Traefik process. The plugin intentionally does not watch the file or detect in-place changes. Replacing or modifying a file at the same `filePath` does not update the redirects used by the running process. To apply new rules, start a new Traefik process, for example through a restart or rolling deployment. The new process starts with an empty plugin cache and loads the current rules file once.
 
 The path must be absolute. File mode accepts only regular files with a maximum size of 16 MiB (16,777,216 bytes). Directories, pipes, devices, sockets, and other special files are rejected.
 
@@ -93,15 +95,28 @@ spec:
       filePath: /etc/traefik/bulk-redirects/redirects.json
 ```
 
-### Kubernetes ConfigMap
+### Kubernetes deployment example
 
-The plugin does not call Kubernetes APIs. The file must be mounted into every Traefik pod by the deployment configuration.
+The lifecycle described above is the plugin contract and is independent of any deployment platform. The plugin does not call Kubernetes APIs. In Kubernetes, the rules file must be mounted into every Traefik pod by the deployment configuration.
+
+A content-addressed ConfigMap can connect a rules change to the required Traefik rollout. For example, Kustomize adds a content hash to generated ConfigMap names by default:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+- name: bulk-redirect-rules
+  files:
+  - redirects.json
+```
+
+This produces a ConfigMap such as `bulk-redirect-rules-<content-hash>`:
 
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: bulk-redirect-rules
+  name: bulk-redirect-rules-<content-hash>
 data:
   redirects.json: |
     {
@@ -117,7 +132,7 @@ data:
     }
 ```
 
-Example Deployment fragments:
+Reference the generated ConfigMap from the Traefik Deployment or HelmRelease. A Deployment fragment can use the generator's base name because Kustomize updates known ConfigMap references to the generated name:
 
 ```yaml
 spec:
@@ -137,11 +152,7 @@ spec:
 
 ### Updating file-based rules
 
-File mode treats a rules file as immutable for the lifetime of the Traefik process. The process keeps the first successfully compiled snapshot for each `filePath`. Replacing the file at the same path while Traefik is running does not invalidate that snapshot.
-
-When the rules change, deploy the file as a new version and restart or roll out Traefik. For Kubernetes deployments, content-versioned ConfigMaps are recommended. For example, Kustomize's default ConfigMap generator behavior adds a content hash to generated ConfigMap names. A change to `redirects.json` then produces a new ConfigMap reference and a Traefik rollout.
-
-The plugin does not watch files or call Kubernetes APIs. New file contents become active only in a new Traefik process with an empty plugin cache.
+When `redirects.json` changes, Kustomize generates a different ConfigMap name. Propagating that name into the Deployment PodTemplate, directly or through HelmRelease values, triggers a rolling update. Each new Traefik process starts with an empty plugin cache and loads the new ruleset on first use. Because HelmRelease is a custom resource, its nested ConfigMap references may require a Kustomize `nameReference` configuration rather than relying on the built-in Deployment field handling.
 
 # Static configuration
 

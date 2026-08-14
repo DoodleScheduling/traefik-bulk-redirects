@@ -48,10 +48,9 @@ type compiledRedirects struct {
 }
 
 const (
-	modeInline          = "inline"
-	modeFile            = "file"
-	maxFileCacheEntries = 8
-	maxRulesFileSize    = 16 << 20
+	modeInline       = "inline"
+	modeFile         = "file"
+	maxRulesFileSize = 16 << 20
 )
 
 var inlineCache struct {
@@ -64,7 +63,6 @@ var inlineCache struct {
 var fileCache = struct {
 	sync.Mutex
 	entries map[string]*compiledRedirects
-	order   []string
 }{
 	entries: make(map[string]*compiledRedirects),
 }
@@ -170,12 +168,7 @@ func loadFileRedirects(config *Config) (*compiledRedirects, error) {
 		return nil, fmt.Errorf("invalid redirect in file %q: %w", config.FilePath, err)
 	}
 
-	if len(fileCache.order) == maxFileCacheEntries {
-		delete(fileCache.entries, fileCache.order[0])
-		fileCache.order = fileCache.order[1:]
-	}
 	fileCache.entries[config.FilePath] = compiled
-	fileCache.order = append(fileCache.order, config.FilePath)
 
 	return compiled, nil
 }

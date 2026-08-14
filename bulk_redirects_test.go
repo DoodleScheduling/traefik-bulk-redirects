@@ -1156,25 +1156,36 @@ func TestConcurrentServeHTTPWithSharedFileCompiledRedirects(t *testing.T) {
 	}
 }
 
-func TestFileCacheIsBoundedAndEvictionKeepsOldHandlersValid(t *testing.T) {
+func TestFileCacheRetainsMoreThanEightDistinctPaths(t *testing.T) {
 	resetCaches()
-	var firstHandler *BulkRedirects
-	for i := 0; i < maxFileCacheEntries+2; i++ {
+	const pathCount = 16
+	var firstPath string
+	var firstCompiled *compiledRedirects
+	for i := 0; i < pathCount; i++ {
 		id := string(rune('a' + i))
-		path := writeRedirectFile(t, testCacheConfig("eviction-"+id).Redirects)
+		path := writeRedirectFile(t, testCacheConfig("retained-"+id).Redirects)
 		handler := newBulkRedirects(t, fileConfig(path))
 		if i == 0 {
-			firstHandler = handler
+			firstPath = path
+			firstCompiled = handler.compiled
 		}
 	}
 
 	fileCache.Lock()
 	cacheSize := len(fileCache.entries)
 	fileCache.Unlock()
-	if cacheSize != maxFileCacheEntries {
-		t.Fatalf("expected file cache size %d, got %d", maxFileCacheEntries, cacheSize)
+	if cacheSize != pathCount {
+		t.Fatalf("expected file cache size %d, got %d", pathCount, cacheSize)
 	}
-	assertHandlerRedirect(t, firstHandler, "https://cache-eviction-a.example/source", "https://cache-eviction-a.example/target")
+
+	if err := os.Remove(firstPath); err != nil {
+		t.Fatal(err)
+	}
+	firstAgain := newBulkRedirects(t, fileConfig(firstPath))
+	if firstAgain.compiled != firstCompiled {
+		t.Fatal("first file path did not retain its original compiled redirects")
+	}
+	assertHandlerRedirect(t, firstAgain, "https://cache-retained-a.example/source", "https://cache-retained-a.example/target")
 }
 
 func fileConfig(path string) *Config {
@@ -1269,7 +1280,6 @@ func resetCaches() {
 func resetFileCache() {
 	fileCache.Lock()
 	fileCache.entries = make(map[string]*compiledRedirects)
-	fileCache.order = nil
 	fileCache.Unlock()
 }
 
