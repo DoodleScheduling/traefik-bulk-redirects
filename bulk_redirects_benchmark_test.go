@@ -90,14 +90,16 @@ func BenchmarkNewFileCached(b *testing.B) {
 			if _, err := New(context.Background(), nextHandler(), config, "bulk-redirects"); err != nil {
 				b.Fatal(err)
 			}
+			if err := os.Remove(config.FilePath); err != nil {
+				b.Fatal(err)
+			}
 
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				currentConfig := &Config{
-					Mode:         modeFile,
-					FilePath:     config.FilePath,
-					FileChecksum: config.FileChecksum,
+					Mode:     modeFile,
+					FilePath: config.FilePath,
 				}
 				var err error
 				benchmarkHandler, err = New(context.Background(), nextHandler(), currentConfig, "bulk-redirects")
@@ -134,7 +136,7 @@ func benchmarkFileConfig(b *testing.B, count int) *Config {
 	if err := os.WriteFile(path, fileBytes, 0o600); err != nil {
 		b.Fatal(err)
 	}
-	return fileConfig(path, checksumForBytes(fileBytes))
+	return fileConfig(path)
 }
 
 func benchmarkConfig(count int) *Config {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -865,22 +864,16 @@ func TestInlineModesRemainBackwardsCompatible(t *testing.T) {
 }
 
 func TestNewValidatesConfigurationMode(t *testing.T) {
-	validChecksum := "sha256:" + strings.Repeat("0", sha256.Size*2)
 	tests := []struct {
 		name     string
 		config   *Config
 		expected string
 	}{
 		{name: "unknown mode", config: &Config{Mode: "unknown"}, expected: `unsupported bulk redirects mode "unknown"`},
-		{name: "inline file path", config: &Config{FilePath: "/redirects.json"}, expected: "filePath/fileChecksum cannot be configured in inline mode"},
-		{name: "inline checksum", config: &Config{Mode: modeInline, FileChecksum: validChecksum}, expected: "filePath/fileChecksum cannot be configured in inline mode"},
-		{name: "file redirects", config: &Config{Mode: modeFile, Redirects: []Redirect{{}}, FilePath: "/redirects.json", FileChecksum: validChecksum}, expected: `redirects cannot be configured inline when mode is "file"`},
-		{name: "file path missing", config: &Config{Mode: modeFile, FileChecksum: validChecksum}, expected: "filePath is required in file mode"},
-		{name: "relative file path", config: &Config{Mode: modeFile, FilePath: "redirects.json", FileChecksum: validChecksum}, expected: "filePath must be absolute in file mode"},
-		{name: "checksum missing", config: &Config{Mode: modeFile, FilePath: "/redirects.json"}, expected: "fileChecksum is required in file mode"},
-		{name: "checksum short", config: &Config{Mode: modeFile, FilePath: "/redirects.json", FileChecksum: "sha256:1234"}, expected: "invalid fileChecksum"},
-		{name: "checksum uppercase", config: &Config{Mode: modeFile, FilePath: "/redirects.json", FileChecksum: "sha256:" + strings.Repeat("A", sha256.Size*2)}, expected: "invalid fileChecksum"},
-		{name: "checksum non hexadecimal", config: &Config{Mode: modeFile, FilePath: "/redirects.json", FileChecksum: "sha256:" + strings.Repeat("z", sha256.Size*2)}, expected: "invalid fileChecksum"},
+		{name: "inline file path", config: &Config{FilePath: "/redirects.json"}, expected: "filePath cannot be configured in inline mode"},
+		{name: "file redirects", config: &Config{Mode: modeFile, Redirects: []Redirect{{}}, FilePath: "/redirects.json"}, expected: `redirects cannot be configured inline when mode is "file"`},
+		{name: "file path missing", config: &Config{Mode: modeFile}, expected: "filePath is required in file mode"},
+		{name: "relative file path", config: &Config{Mode: modeFile, FilePath: "redirects.json"}, expected: "filePath must be absolute in file mode"},
 	}
 
 	for _, tt := range tests {
@@ -891,46 +884,39 @@ func TestNewValidatesConfigurationMode(t *testing.T) {
 	}
 }
 
-func TestFileModeReadChecksumAndJSONErrors(t *testing.T) {
+func TestFileModeReadAndJSONErrors(t *testing.T) {
 	t.Run("missing file", func(t *testing.T) {
 		resetCaches()
 		path := filepath.Join(t.TempDir(), "missing.json")
-		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksumForBytes(nil)), "bulk-redirects")
+		_, err := New(context.Background(), nextHandler(), fileConfig(path), "bulk-redirects")
 		assertErrorContains(t, err, "unable to read redirects file")
-	})
-
-	t.Run("checksum mismatch", func(t *testing.T) {
-		resetCaches()
-		path := filepath.Join(t.TempDir(), "redirects.json")
-		if err := os.WriteFile(path, []byte(`{"redirects":[]}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksumForBytes([]byte("different"))), "bulk-redirects")
-		assertErrorContains(t, err, "checksum mismatch for redirects file")
-		assertErrorContains(t, err, "expected sha256:")
-		if strings.Contains(err.Error(), "got sha256:") {
-			t.Fatalf("checksum mismatch exposed calculated checksum: %v", err)
-		}
 	})
 
 	t.Run("invalid JSON", func(t *testing.T) {
 		resetCaches()
-		path, checksum := writeRedirectBytes(t, []byte(`{"redirects":`))
-		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksum), "bulk-redirects")
+		path := writeRedirectBytes(t, []byte(`{"redirects":`))
+		_, err := New(context.Background(), nextHandler(), fileConfig(path), "bulk-redirects")
 		assertErrorContains(t, err, "unable to decode redirects file")
 	})
 
 	t.Run("unknown file field", func(t *testing.T) {
 		resetCaches()
-		path, checksum := writeRedirectBytes(t, []byte(`{"redirects":[],"mode":"inline"}`))
-		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksum), "bulk-redirects")
+		path := writeRedirectBytes(t, []byte(`{"redirects":[],"mode":"inline"}`))
+		_, err := New(context.Background(), nextHandler(), fileConfig(path), "bulk-redirects")
 		assertErrorContains(t, err, "unable to decode redirects file")
+	})
+
+	t.Run("multiple JSON values", func(t *testing.T) {
+		resetCaches()
+		path := writeRedirectBytes(t, []byte(`{"redirects":[]} {"redirects":[]}`))
+		_, err := New(context.Background(), nextHandler(), fileConfig(path), "bulk-redirects")
+		assertErrorContains(t, err, "multiple JSON values are not allowed")
 	})
 
 	t.Run("invalid redirect", func(t *testing.T) {
 		resetCaches()
-		path, checksum := writeRedirectFile(t, []Redirect{{TargetURL: "https://example.com/target"}})
-		_, err := New(context.Background(), nextHandler(), fileConfig(path, checksum), "bulk-redirects")
+		path := writeRedirectFile(t, []Redirect{{TargetURL: "https://example.com/target"}})
+		_, err := New(context.Background(), nextHandler(), fileConfig(path), "bulk-redirects")
 		assertErrorContains(t, err, "invalid redirect in file")
 		assertErrorContains(t, err, "sourceURL is required")
 	})
@@ -964,7 +950,7 @@ func TestReadRulesFileRejectsNonRegularFile(t *testing.T) {
 
 func TestFileModeRedirectBehavior(t *testing.T) {
 	resetCaches()
-	path, checksum := writeRedirectFile(t, []Redirect{
+	path := writeRedirectFile(t, []Redirect{
 		{
 			SourceURL:           "https://file.example/exact",
 			TargetURL:           "https://file.example/exact-target",
@@ -979,7 +965,7 @@ func TestFileModeRedirectBehavior(t *testing.T) {
 			SubpathMatching:     true,
 		},
 	})
-	handler := newBulkRedirects(t, fileConfig(path, checksum))
+	handler := newBulkRedirects(t, fileConfig(path))
 
 	tests := []struct {
 		name     string
@@ -1007,90 +993,103 @@ func TestFileModeRedirectBehavior(t *testing.T) {
 
 func TestFileModeCacheHitDoesNotReadFileAgain(t *testing.T) {
 	resetCaches()
-	path, checksum := writeRedirectFile(t, testCacheConfig("file-cache").Redirects)
-	first := newBulkRedirects(t, fileConfig(path, checksum))
+	path := writeRedirectFile(t, testCacheConfig("file-cache").Redirects)
+	first := newBulkRedirects(t, fileConfig(path))
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	second := newBulkRedirects(t, fileConfig(path, checksum))
+	second := newBulkRedirects(t, fileConfig(path))
 
 	if first.compiled != second.compiled {
-		t.Fatal("same file cache key did not reuse compiled redirects")
+		t.Fatal("same file path did not reuse compiled redirects")
 	}
 }
 
-func TestFileModeNewChecksumLoadsNewVersionAndKeepsOldHandlerValid(t *testing.T) {
+func TestFileModeDifferentPathsUseDifferentCompiledRedirects(t *testing.T) {
 	resetCaches()
-	path, checksumA := writeRedirectFile(t, testCacheConfig("version-a").Redirects)
-	handlerA := newBulkRedirects(t, fileConfig(path, checksumA))
+	pathA := writeRedirectFile(t, testCacheConfig("different-path-a").Redirects)
+	pathB := writeRedirectFile(t, testCacheConfig("different-path-b").Redirects)
 
-	redirectsB := testCacheConfig("version-b").Redirects
-	checksumB := overwriteRedirectFile(t, path, redirectsB)
-	handlerB := newBulkRedirects(t, fileConfig(path, checksumB))
+	handlerA := newBulkRedirects(t, fileConfig(pathA))
+	handlerB := newBulkRedirects(t, fileConfig(pathB))
 	if handlerA.compiled == handlerB.compiled {
-		t.Fatal("new checksum reused previous compiled redirects")
+		t.Fatal("different file paths reused compiled redirects")
+	}
+
+	assertHandlerRedirect(t, handlerA, "https://cache-different-path-a.example/source", "https://cache-different-path-a.example/target")
+	assertHandlerRedirect(t, handlerB, "https://cache-different-path-b.example/source", "https://cache-different-path-b.example/target")
+}
+
+func TestFileModeTreatsPathAsImmutableForProcessLifetime(t *testing.T) {
+	resetCaches()
+	path := writeRedirectFile(t, testCacheConfig("version-a").Redirects)
+	handlerA := newBulkRedirects(t, fileConfig(path))
+
+	overwriteRedirectFile(t, path, testCacheConfig("version-b").Redirects)
+	handlerB := newBulkRedirects(t, fileConfig(path))
+	if handlerA.compiled != handlerB.compiled {
+		t.Fatal("same file path did not reuse the immutable compiled snapshot")
 	}
 
 	assertHandlerRedirect(t, handlerA, "https://cache-version-a.example/source", "https://cache-version-a.example/target")
+	assertHandlerRedirect(t, handlerB, "https://cache-version-a.example/source", "https://cache-version-a.example/target")
+}
+
+func TestFileModeEmptyCacheLoadsCurrentFileVersion(t *testing.T) {
+	resetCaches()
+	path := writeRedirectFile(t, testCacheConfig("version-a").Redirects)
+	newBulkRedirects(t, fileConfig(path))
+	overwriteRedirectFile(t, path, testCacheConfig("version-b").Redirects)
+
+	resetFileCache()
+	handlerB := newBulkRedirects(t, fileConfig(path))
 	assertHandlerRedirect(t, handlerB, "https://cache-version-b.example/source", "https://cache-version-b.example/target")
 }
 
-func TestFailedFileVersionDoesNotReplaceValidCache(t *testing.T) {
-	resetCaches()
-	path, checksumA := writeRedirectFile(t, testCacheConfig("valid-version").Redirects)
-	handlerA := newBulkRedirects(t, fileConfig(path, checksumA))
+func TestFailedFileLoadDoesNotPublishCacheEntry(t *testing.T) {
+	tests := []struct {
+		name          string
+		fileBytes     []byte
+		expectedError string
+	}{
+		{name: "invalid JSON", fileBytes: []byte(`{"redirects":`), expectedError: "unable to decode redirects file"},
+		{name: "invalid redirect", fileBytes: []byte(`{"redirects":[{"targetURL":"https://example.com/target"}]}`), expectedError: "invalid redirect in file"},
+	}
 
-	badBytes := []byte(`{"redirects":`)
-	if err := os.WriteFile(path, badBytes, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := New(context.Background(), nextHandler(), fileConfig(path, checksumForBytes(badBytes)), "bulk-redirects")
-	assertErrorContains(t, err, "unable to decode redirects file")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCaches()
+			path := writeRedirectBytes(t, tt.fileBytes)
+			_, err := New(context.Background(), nextHandler(), fileConfig(path), "bulk-redirects")
+			assertErrorContains(t, err, tt.expectedError)
 
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
+			overwriteRedirectFile(t, path, testCacheConfig("valid-after-failure").Redirects)
+			handler := newBulkRedirects(t, fileConfig(path))
+			assertHandlerRedirect(t, handler, "https://cache-valid-after-failure.example/source", "https://cache-valid-after-failure.example/target")
+			fileCache.Lock()
+			cacheSize := len(fileCache.entries)
+			fileCache.Unlock()
+			if cacheSize != 1 {
+				t.Fatalf("expected one valid cached entry, got %d", cacheSize)
+			}
+		})
 	}
-	cachedA := newBulkRedirects(t, fileConfig(path, checksumA))
-	if handlerA.compiled != cachedA.compiled {
-		t.Fatal("failed version replaced valid cached version")
-	}
-	assertHandlerRedirect(t, handlerA, "https://cache-valid-version.example/source", "https://cache-valid-version.example/target")
 }
 
-func TestOversizedFileDoesNotReplaceValidCache(t *testing.T) {
+func TestOversizedFileDoesNotPublishCacheEntry(t *testing.T) {
 	resetCaches()
-	path, checksumA := writeRedirectFile(t, testCacheConfig("valid-before-oversized").Redirects)
-	handlerA := newBulkRedirects(t, fileConfig(path, checksumA))
-
-	if err := os.Truncate(path, int64(maxRulesFileSize)+1); err != nil {
-		t.Fatal(err)
-	}
-	_, err := New(
-		context.Background(),
-		nextHandler(),
-		fileConfig(path, "sha256:"+strings.Repeat("0", sha256.Size*2)),
-		"bulk-redirects",
-	)
+	path := writeSizedFile(t, maxRulesFileSize+1)
+	_, err := New(context.Background(), nextHandler(), fileConfig(path), "bulk-redirects")
 	assertErrorContains(t, err, "exceeds maximum size of 16777216 bytes")
 
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	cachedA := newBulkRedirects(t, fileConfig(path, checksumA))
-	if handlerA.compiled != cachedA.compiled {
-		t.Fatal("oversized version replaced valid cached version")
-	}
-	assertHandlerRedirect(
-		t,
-		handlerA,
-		"https://cache-valid-before-oversized.example/source",
-		"https://cache-valid-before-oversized.example/target",
-	)
+	overwriteRedirectFile(t, path, testCacheConfig("valid-after-oversized").Redirects)
+	handler := newBulkRedirects(t, fileConfig(path))
+	assertHandlerRedirect(t, handler, "https://cache-valid-after-oversized.example/source", "https://cache-valid-after-oversized.example/target")
 }
 
 func TestConcurrentNewWithFileCacheKeyReusesCompiledRedirects(t *testing.T) {
 	resetCaches()
-	path, checksum := writeRedirectFile(t, testCacheConfig("concurrent-file").Redirects)
+	path := writeRedirectFile(t, testCacheConfig("concurrent-file").Redirects)
 
 	const goroutines = 100
 	results := make(chan *compiledRedirects, goroutines)
@@ -1100,7 +1099,7 @@ func TestConcurrentNewWithFileCacheKeyReusesCompiledRedirects(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handler, err := New(context.Background(), nextHandler(), fileConfig(path, checksum), "bulk-redirects")
+			handler, err := New(context.Background(), nextHandler(), fileConfig(path), "bulk-redirects")
 			if err != nil {
 				errs <- err
 				return
@@ -1127,9 +1126,9 @@ func TestConcurrentNewWithFileCacheKeyReusesCompiledRedirects(t *testing.T) {
 
 func TestConcurrentServeHTTPWithSharedFileCompiledRedirects(t *testing.T) {
 	resetCaches()
-	path, checksum := writeRedirectFile(t, testCacheConfig("file-serve").Redirects)
-	first := newBulkRedirects(t, fileConfig(path, checksum))
-	second := newBulkRedirects(t, fileConfig(path, checksum))
+	path := writeRedirectFile(t, testCacheConfig("file-serve").Redirects)
+	first := newBulkRedirects(t, fileConfig(path))
+	second := newBulkRedirects(t, fileConfig(path))
 
 	const goroutines = 100
 	errs := make(chan string, goroutines)
@@ -1162,8 +1161,8 @@ func TestFileCacheIsBoundedAndEvictionKeepsOldHandlersValid(t *testing.T) {
 	var firstHandler *BulkRedirects
 	for i := 0; i < maxFileCacheEntries+2; i++ {
 		id := string(rune('a' + i))
-		path, checksum := writeRedirectFile(t, testCacheConfig("eviction-"+id).Redirects)
-		handler := newBulkRedirects(t, fileConfig(path, checksum))
+		path := writeRedirectFile(t, testCacheConfig("eviction-"+id).Redirects)
+		handler := newBulkRedirects(t, fileConfig(path))
 		if i == 0 {
 			firstHandler = handler
 		}
@@ -1178,11 +1177,11 @@ func TestFileCacheIsBoundedAndEvictionKeepsOldHandlersValid(t *testing.T) {
 	assertHandlerRedirect(t, firstHandler, "https://cache-eviction-a.example/source", "https://cache-eviction-a.example/target")
 }
 
-func fileConfig(path, checksum string) *Config {
-	return &Config{Mode: modeFile, FilePath: path, FileChecksum: checksum}
+func fileConfig(path string) *Config {
+	return &Config{Mode: modeFile, FilePath: path}
 }
 
-func writeRedirectFile(t *testing.T, redirects []Redirect) (string, string) {
+func writeRedirectFile(t *testing.T, redirects []Redirect) string {
 	t.Helper()
 	fileBytes, err := json.Marshal(fileRedirects{Redirects: redirects})
 	if err != nil {
@@ -1191,16 +1190,16 @@ func writeRedirectFile(t *testing.T, redirects []Redirect) (string, string) {
 	return writeRedirectBytes(t, fileBytes)
 }
 
-func writeRedirectBytes(t *testing.T, fileBytes []byte) (string, string) {
+func writeRedirectBytes(t *testing.T, fileBytes []byte) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "redirects.json")
 	if err := os.WriteFile(path, fileBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return path, checksumForBytes(fileBytes)
+	return path
 }
 
-func overwriteRedirectFile(t *testing.T, path string, redirects []Redirect) string {
+func overwriteRedirectFile(t *testing.T, path string, redirects []Redirect) {
 	t.Helper()
 	fileBytes, err := json.Marshal(fileRedirects{Redirects: redirects})
 	if err != nil {
@@ -1209,12 +1208,6 @@ func overwriteRedirectFile(t *testing.T, path string, redirects []Redirect) stri
 	if err := os.WriteFile(path, fileBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return checksumForBytes(fileBytes)
-}
-
-func checksumForBytes(fileBytes []byte) string {
-	checksum := sha256.Sum256(fileBytes)
-	return "sha256:" + hex.EncodeToString(checksum[:])
 }
 
 func writeSizedFile(t *testing.T, size int) string {
@@ -1275,7 +1268,7 @@ func resetCaches() {
 
 func resetFileCache() {
 	fileCache.Lock()
-	fileCache.entries = make(map[fileCacheKey]*compiledRedirects)
+	fileCache.entries = make(map[string]*compiledRedirects)
 	fileCache.order = nil
 	fileCache.Unlock()
 }

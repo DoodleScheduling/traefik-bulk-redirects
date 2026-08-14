@@ -18,10 +18,9 @@ import (
 )
 
 type Config struct {
-	Mode         string     `json:"mode,omitempty"`
-	Redirects    []Redirect `json:"redirects,omitempty"`
-	FilePath     string     `json:"filePath,omitempty"`
-	FileChecksum string     `json:"fileChecksum,omitempty"`
+	Mode      string     `json:"mode,omitempty"`
+	Redirects []Redirect `json:"redirects,omitempty"`
+	FilePath  string     `json:"filePath,omitempty"`
 }
 
 type Redirect struct {
@@ -62,17 +61,12 @@ var inlineCache struct {
 	compiled *compiledRedirects
 }
 
-type fileCacheKey struct {
-	path     string
-	checksum string
-}
-
 var fileCache = struct {
 	sync.Mutex
-	entries map[fileCacheKey]*compiledRedirects
-	order   []fileCacheKey
+	entries map[string]*compiledRedirects
+	order   []string
 }{
-	entries: make(map[fileCacheKey]*compiledRedirects),
+	entries: make(map[string]*compiledRedirects),
 }
 
 func CreateConfig() *Config {
@@ -92,8 +86,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 	switch config.Mode {
 	case "", modeInline:
-		if config.FilePath != "" || config.FileChecksum != "" {
-			return nil, fmt.Errorf("filePath/fileChecksum cannot be configured in inline mode")
+		if config.FilePath != "" {
+			return nil, fmt.Errorf("filePath cannot be configured in inline mode")
 		}
 
 		compiled, err := loadInlineRedirects(config)
@@ -154,31 +148,16 @@ func loadFileRedirects(config *Config) (*compiledRedirects, error) {
 	if !filepath.IsAbs(config.FilePath) {
 		return nil, fmt.Errorf("filePath must be absolute in file mode, got %q", config.FilePath)
 	}
-	if config.FileChecksum == "" {
-		return nil, fmt.Errorf("fileChecksum is required in file mode")
-	}
-
-	expectedChecksum, canonicalChecksum, err := parseFileChecksum(config.FileChecksum)
-	if err != nil {
-		return nil, err
-	}
-
-	key := fileCacheKey{path: config.FilePath, checksum: canonicalChecksum}
 	fileCache.Lock()
 	defer fileCache.Unlock()
 
-	if compiled, found := fileCache.entries[key]; found {
+	if compiled, found := fileCache.entries[config.FilePath]; found {
 		return compiled, nil
 	}
 
 	fileBytes, err := readRulesFile(config.FilePath)
 	if err != nil {
 		return nil, err
-	}
-
-	actualChecksum := sha256.Sum256(fileBytes)
-	if actualChecksum != expectedChecksum {
-		return nil, fmt.Errorf("checksum mismatch for redirects file %q: expected %s", config.FilePath, canonicalChecksum)
 	}
 
 	redirectFile, err := decodeRedirectsFile(fileBytes)
@@ -195,8 +174,8 @@ func loadFileRedirects(config *Config) (*compiledRedirects, error) {
 		delete(fileCache.entries, fileCache.order[0])
 		fileCache.order = fileCache.order[1:]
 	}
-	fileCache.entries[key] = compiled
-	fileCache.order = append(fileCache.order, key)
+	fileCache.entries[config.FilePath] = compiled
+	fileCache.order = append(fileCache.order, config.FilePath)
 
 	return compiled, nil
 }
@@ -241,42 +220,7 @@ func validateRulesFileInfo(path string, info os.FileInfo) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("redirects file %q is not a regular file", path)
 	}
-	if info.Size() > int64(maxRulesFileSize) {
-		return fmt.Errorf("redirects file %q exceeds maximum size of %d bytes", path, maxRulesFileSize)
-	}
 	return nil
-}
-
-func parseFileChecksum(value string) ([sha256.Size]byte, string, error) {
-	const prefix = "sha256:"
-	var checksum [sha256.Size]byte
-
-	if len(value) != len(prefix)+sha256.Size*2 || !strings.HasPrefix(value, prefix) {
-		return checksum, "", fmt.Errorf("invalid fileChecksum %q: expected sha256:<64 lowercase hexadecimal characters>", value)
-	}
-
-	encoded := value[len(prefix):]
-	for i := range checksum {
-		high, highValid := lowercaseHexValue(encoded[i*2])
-		low, lowValid := lowercaseHexValue(encoded[i*2+1])
-		if !highValid || !lowValid {
-			return checksum, "", fmt.Errorf("invalid fileChecksum %q: expected sha256:<64 lowercase hexadecimal characters>", value)
-		}
-		checksum[i] = high<<4 | low
-	}
-
-	return checksum, value, nil
-}
-
-func lowercaseHexValue(value byte) (byte, bool) {
-	switch {
-	case value >= '0' && value <= '9':
-		return value - '0', true
-	case value >= 'a' && value <= 'f':
-		return value - 'a' + 10, true
-	default:
-		return 0, false
-	}
 }
 
 func decodeRedirectsFile(fileBytes []byte) (*fileRedirects, error) {
