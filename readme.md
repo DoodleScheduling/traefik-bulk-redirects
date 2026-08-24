@@ -20,9 +20,16 @@ This plugin supports exact redirects, subpath redirects, query string preservati
 | `preserveQueryString` | `enabled` appends the original query string to the target URL |
 | `subpathMatching` | `enabled` matches the source path and all child paths below it |
 
-# Configuration
+# Configuration modes
 
-Example usage
+The plugin supports `inline` and `file` configuration. Inline mode is backwards-compatible and convenient for small rulesets. File mode is recommended for large rulesets and global middlewares because the parsed and compiled redirects are shared by file path for the lifetime of the Traefik process.
+
+## Inline mode
+
+Inline mode embeds redirects in the Middleware resource. It is selected when `mode` is omitted or set to `inline`.
+
+Existing configurations do not need to change:
+
 
 ```yaml
 apiVersion: traefik.io/v1alpha1
@@ -32,6 +39,7 @@ metadata:
 spec:
   plugin:
     bulkRedirects:
+      # mode: inline # Optional; inline is the default.
       redirects:
       - sourceURL: https://example.com/premium/coupon
         targetURL: https://example.com/en/premium/
@@ -45,6 +53,107 @@ spec:
         subpathMatching: enabled
 ```
 
+Inline mode is simple, but Traefik must decode the complete redirect list for every middleware instance. Prefer file mode for large rulesets.
+
+## File mode
+
+File mode loads redirects from a JSON file mounted in the Traefik container. The first `New()` call for a new `filePath` reads, decodes, validates and compiles the file. Compiled file-based rulesets are cached by file path for the lifetime of the Traefik process. Subsequent middleware instances using that path reuse the exact compiled ruleset from memory. Cached middleware construction performs no filesystem reads or stats, hashing, JSON decoding, redirect validation or recompilation.
+
+File contents are considered immutable for the lifetime of the Traefik process. The plugin intentionally does not watch the file or detect in-place changes. Replacing or modifying a file at the same `filePath` does not update the redirects used by the running process. To apply new rules, start a new Traefik process, for example through a restart or rolling deployment. The new process starts with an empty plugin cache and loads the current rules file once.
+
+The path must be absolute. File mode accepts only regular files with a maximum size of 16 MiB (16,777,216 bytes). Directories, pipes, devices, sockets, and other special files are rejected.
+
+### Redirect file
+
+```json
+{
+  "redirects": [
+    {
+      "sourceURL": "https://example.com/old",
+      "targetURL": "https://example.com/new",
+      "statusCode": 301,
+      "preserveQueryString": true,
+      "subpathMatching": false
+    }
+  ]
+}
+```
+
+Only the `redirects` field is accepted in this file. Configuration fields such as `mode` and `filePath` belong in the Middleware resource.
+
+### Middleware
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: bulk-redirects
+spec:
+  plugin:
+    bulkRedirects:
+      mode: file
+      filePath: /etc/traefik/bulk-redirects/redirects.json
+```
+
+### Kubernetes deployment example
+
+The lifecycle described above is the plugin contract and is independent of any deployment platform. The plugin does not call Kubernetes APIs. In Kubernetes, the rules file must be mounted into every Traefik pod by the deployment configuration.
+
+A content-addressed ConfigMap can connect a rules change to the required Traefik rollout. For example, Kustomize adds a content hash to generated ConfigMap names by default:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+- name: bulk-redirect-rules
+  files:
+  - redirects.json
+```
+
+This produces a ConfigMap such as `bulk-redirect-rules-<content-hash>`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bulk-redirect-rules-<content-hash>
+data:
+  redirects.json: |
+    {
+      "redirects": [
+        {
+          "sourceURL": "https://example.com/old",
+          "targetURL": "https://example.com/new",
+          "statusCode": 301,
+          "preserveQueryString": true,
+          "subpathMatching": false
+        }
+      ]
+    }
+```
+
+Reference the generated ConfigMap from the Traefik Deployment or HelmRelease. A Deployment fragment can use the generator's base name because Kustomize updates known ConfigMap references to the generated name:
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: traefik
+          volumeMounts:
+            - name: bulk-redirect-rules
+              mountPath: /etc/traefik/bulk-redirects
+              readOnly: true
+      volumes:
+        - name: bulk-redirect-rules
+          configMap:
+            name: bulk-redirect-rules
+```
+
+### Updating file-based rules
+
+When `redirects.json` changes, Kustomize generates a different ConfigMap name. Propagating that name into the Deployment PodTemplate, directly or through HelmRelease values, triggers a rolling update. Each new Traefik process starts with an empty plugin cache and loads the new ruleset on first use. Because HelmRelease is a custom resource, its nested ConfigMap references may require a Kustomize `nameReference` configuration rather than relying on the built-in Deployment field handling.
+
 # Static configuration
 
 ```yaml
@@ -54,4 +163,3 @@ experimental:
       moduleName: github.com/doodlescheduling/traefik-bulk-redirects
       version: v0.0.1
 ```
-

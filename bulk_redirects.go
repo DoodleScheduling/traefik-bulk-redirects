@@ -1,16 +1,26 @@
 package traefik_bulk_redirects
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 )
 
 type Config struct {
+	Mode      string     `json:"mode,omitempty"`
 	Redirects []Redirect `json:"redirects,omitempty"`
+	FilePath  string     `json:"filePath,omitempty"`
 }
 
 type Redirect struct {
@@ -32,6 +42,31 @@ type PrefixRedirect struct {
 	Target     Target
 }
 
+type compiledRedirects struct {
+	exactRedirects  map[string]Target
+	prefixRedirects map[string]PrefixRedirect
+}
+
+const (
+	modeInline       = "inline"
+	modeFile         = "file"
+	maxRulesFileSize = 16 << 20
+)
+
+var inlineCache struct {
+	sync.Mutex
+	config   *Config
+	hash     [sha256.Size]byte
+	compiled *compiledRedirects
+}
+
+var fileCache = struct {
+	sync.Mutex
+	entries map[string]*compiledRedirects
+}{
+	entries: make(map[string]*compiledRedirects),
+}
+
 func CreateConfig() *Config {
 	return &Config{
 		Redirects: []Redirect{},
@@ -39,19 +74,181 @@ func CreateConfig() *Config {
 }
 
 type BulkRedirects struct {
-	next            http.Handler
-	name            string
-	exactRedirects  map[string]Target
-	prefixRedirects map[string]PrefixRedirect
+	next     http.Handler
+	name     string
+	compiled *compiledRedirects
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	_ = ctx
 
-	exactRedirects := make(map[string]Target, len(config.Redirects))
+	switch config.Mode {
+	case "", modeInline:
+		if config.FilePath != "" {
+			return nil, fmt.Errorf("filePath cannot be configured in inline mode")
+		}
+
+		compiled, err := loadInlineRedirects(config)
+		if err != nil {
+			return nil, err
+		}
+		return newHandler(next, name, compiled), nil
+
+	case modeFile:
+		compiled, err := loadFileRedirects(config)
+		if err != nil {
+			return nil, err
+		}
+		return newHandler(next, name, compiled), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported bulk redirects mode %q", config.Mode)
+	}
+}
+
+func loadInlineRedirects(config *Config) (*compiledRedirects, error) {
+	inlineCache.Lock()
+	defer inlineCache.Unlock()
+
+	if inlineCache.compiled != nil && inlineCache.config == config {
+		return inlineCache.compiled, nil
+	}
+
+	hash := configHash(config)
+	if inlineCache.compiled != nil && inlineCache.hash == hash {
+		inlineCache.config = config
+		return inlineCache.compiled, nil
+	}
+
+	compiled, err := compileRedirects(config.Redirects)
+	if err != nil {
+		return nil, err
+	}
+
+	inlineCache.hash = hash
+	inlineCache.compiled = compiled
+	inlineCache.config = config
+
+	return compiled, nil
+}
+
+type fileRedirects struct {
+	Redirects []Redirect `json:"redirects"`
+}
+
+func loadFileRedirects(config *Config) (*compiledRedirects, error) {
+	if len(config.Redirects) != 0 {
+		return nil, fmt.Errorf("redirects cannot be configured inline when mode is %q", modeFile)
+	}
+	if config.FilePath == "" {
+		return nil, fmt.Errorf("filePath is required in file mode")
+	}
+	if !filepath.IsAbs(config.FilePath) {
+		return nil, fmt.Errorf("filePath must be absolute in file mode, got %q", config.FilePath)
+	}
+	fileCache.Lock()
+	defer fileCache.Unlock()
+
+	if compiled, found := fileCache.entries[config.FilePath]; found {
+		return compiled, nil
+	}
+
+	fileBytes, err := readRulesFile(config.FilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	redirectFile, err := decodeRedirectsFile(fileBytes)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode redirects file %q: %w", config.FilePath, err)
+	}
+
+	compiled, err := compileRedirects(redirectFile.Redirects)
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirect in file %q: %w", config.FilePath, err)
+	}
+
+	fileCache.entries[config.FilePath] = compiled
+
+	return compiled, nil
+}
+
+func readRulesFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read redirects file %q: %w", path, err)
+	}
+	if err := validateRulesFileInfo(path, info); err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read redirects file %q: %w", path, err)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	info, err = file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("unable to stat redirects file %q: %w", path, err)
+	}
+	if err := validateRulesFileInfo(path, info); err != nil {
+		return nil, err
+	}
+
+	fileBytes, err := io.ReadAll(io.LimitReader(file, int64(maxRulesFileSize)+1))
+	if err != nil {
+		return nil, fmt.Errorf("unable to read redirects file %q: %w", path, err)
+	}
+	if len(fileBytes) > maxRulesFileSize {
+		return nil, fmt.Errorf("redirects file %q exceeds maximum size of %d bytes", path, maxRulesFileSize)
+	}
+
+	return fileBytes, nil
+}
+
+func validateRulesFileInfo(path string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("redirects file %q is not a regular file", path)
+	}
+	return nil
+}
+
+func decodeRedirectsFile(fileBytes []byte) (*fileRedirects, error) {
+	decoder := json.NewDecoder(bytes.NewReader(fileBytes))
+	decoder.DisallowUnknownFields()
+
+	var redirects fileRedirects
+	if err := decoder.Decode(&redirects); err != nil {
+		return nil, err
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("multiple JSON values are not allowed")
+		}
+		return nil, err
+	}
+
+	return &redirects, nil
+}
+
+func newHandler(next http.Handler, name string, compiled *compiledRedirects) *BulkRedirects {
+	return &BulkRedirects{
+		next:     next,
+		name:     name,
+		compiled: compiled,
+	}
+}
+
+func compileRedirects(redirects []Redirect) (*compiledRedirects, error) {
+	exactRedirects := make(map[string]Target, len(redirects))
 	prefixRedirects := make(map[string]PrefixRedirect)
 
-	for _, redirect := range config.Redirects {
+	for _, redirect := range redirects {
 		if redirect.StatusCode == 0 {
 			redirect.StatusCode = http.StatusMovedPermanently
 		}
@@ -96,12 +293,51 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		exactRedirects[key] = target
 	}
 
-	return &BulkRedirects{
-		next:            next,
-		name:            name,
+	return &compiledRedirects{
 		exactRedirects:  exactRedirects,
 		prefixRedirects: prefixRedirects,
 	}, nil
+}
+
+func configHash(config *Config) [sha256.Size]byte {
+	hash := sha256.New()
+	var encoded [8]byte
+	var stringBuffer [256]byte
+	var boolBuffer [1]byte
+
+	writeUint64 := func(value uint64) {
+		binary.LittleEndian.PutUint64(encoded[:], value)
+		_, _ = hash.Write(encoded[:])
+	}
+	writeString := func(value string) {
+		writeUint64(uint64(len(value)))
+		for len(value) > 0 {
+			written := copy(stringBuffer[:], value)
+			_, _ = hash.Write(stringBuffer[:written])
+			value = value[written:]
+		}
+	}
+	writeBool := func(value bool) {
+		if value {
+			boolBuffer[0] = 1
+		} else {
+			boolBuffer[0] = 0
+		}
+		_, _ = hash.Write(boolBuffer[:])
+	}
+
+	writeUint64(uint64(len(config.Redirects)))
+	for _, redirect := range config.Redirects {
+		writeString(redirect.SourceURL)
+		writeString(redirect.TargetURL)
+		writeUint64(uint64(redirect.StatusCode))
+		writeBool(redirect.PreserveQueryString)
+		writeBool(redirect.SubpathMatching)
+	}
+
+	var result [sha256.Size]byte
+	hash.Sum(result[:0])
+	return result
 }
 
 func (bulkRedirects *BulkRedirects) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -111,7 +347,7 @@ func (bulkRedirects *BulkRedirects) ServeHTTP(rw http.ResponseWriter, req *http.
 		path = "/"
 	}
 
-	if target, found := bulkRedirects.exactRedirects[buildKey(host, path)]; found {
+	if target, found := bulkRedirects.compiled.exactRedirects[buildKey(host, path)]; found {
 		redirect(rw, req, target, "")
 		return
 	}
@@ -151,7 +387,7 @@ func (bulkRedirects *BulkRedirects) findPrefixRedirect(host, path string) (Prefi
 }
 
 func (bulkRedirects *BulkRedirects) findPrefixCandidate(host, path, candidate string) (PrefixRedirect, bool) {
-	if prefixRedirect, found := bulkRedirects.prefixRedirects[buildKey(host, candidate)]; found {
+	if prefixRedirect, found := bulkRedirects.compiled.prefixRedirects[buildKey(host, candidate)]; found {
 		if isSubpathMatch(path, prefixRedirect.SourcePath) {
 			return prefixRedirect, true
 		}
@@ -163,7 +399,7 @@ func (bulkRedirects *BulkRedirects) findPrefixCandidate(host, path, candidate st
 
 	alternative := toggleTrailingSlash(candidate)
 
-	if prefixRedirect, found := bulkRedirects.prefixRedirects[buildKey(host, alternative)]; found {
+	if prefixRedirect, found := bulkRedirects.compiled.prefixRedirects[buildKey(host, alternative)]; found {
 		if isSubpathMatch(path, prefixRedirect.SourcePath) {
 			return prefixRedirect, true
 		}
