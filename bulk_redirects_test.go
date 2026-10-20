@@ -864,7 +864,7 @@ func TestInlineModesRemainBackwardsCompatible(t *testing.T) {
 	}
 }
 
-// TestConcurrentInlineTenantsDoNotCrossContaminate simulates multiple
+// TestConcurrentInlineInstancesDoNotCrossContaminate simulates multiple
 // independent Middleware instances, each configured with their own, different
 // inline redirect list, all calling New() concurrently. inlineCache is a
 // single global slot keyed by config pointer identity and a content hash, not
@@ -873,7 +873,7 @@ func TestInlineModesRemainBackwardsCompatible(t *testing.T) {
 // compiled redirects, even under concurrent access, though it does mean the
 // cache is only ever a hit for the single most-recently-seen config (an
 // efficiency concern, not a correctness one).
-func TestConcurrentInlineTenantsDoNotCrossContaminate(t *testing.T) {
+func TestConcurrentInlineInstancesDoNotCrossContaminate(t *testing.T) {
 	resetCaches()
 
 	const instances = 20
