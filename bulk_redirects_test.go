@@ -865,60 +865,60 @@ func TestInlineModesRemainBackwardsCompatible(t *testing.T) {
 }
 
 // TestConcurrentInlineTenantsDoNotCrossContaminate simulates multiple
-// independent tenants (e.g. per-devbox Middleware instances) each configured
-// with their own, different inline redirect list, all calling New()
-// concurrently. inlineCache is a single global slot keyed by config pointer
-// identity and a content hash, not a map keyed per tenant -- this proves that
-// sharing that single slot across distinct configs never hands one tenant
-// another tenant's compiled redirects, even under concurrent access, though
-// it does mean the cache is only ever a hit for the single most-recently-seen
-// config (an efficiency concern, not a correctness one).
+// independent Middleware instances, each configured with their own, different
+// inline redirect list, all calling New() concurrently. inlineCache is a
+// single global slot keyed by config pointer identity and a content hash, not
+// a map keyed per instance -- this proves that sharing that single slot
+// across distinct configs never hands one instance another instance's
+// compiled redirects, even under concurrent access, though it does mean the
+// cache is only ever a hit for the single most-recently-seen config (an
+// efficiency concern, not a correctness one).
 func TestConcurrentInlineTenantsDoNotCrossContaminate(t *testing.T) {
 	resetCaches()
 
-	const tenants = 20
-	const callsPerTenant = 10
+	const instances = 20
+	const callsPerInstance = 10
 
-	configs := make([]*Config, tenants)
-	for i := 0; i < tenants; i++ {
-		configs[i] = testCacheConfig("tenant-" + string(rune('a'+i)))
+	configs := make([]*Config, instances)
+	for i := 0; i < instances; i++ {
+		configs[i] = testCacheConfig("instance-" + string(rune('a'+i)))
 	}
 
 	type result struct {
-		tenant int
-		ok     bool
-		detail string
+		instance int
+		ok       bool
+		detail   string
 	}
 
-	results := make(chan result, tenants*callsPerTenant)
+	results := make(chan result, instances*callsPerInstance)
 	var wg sync.WaitGroup
-	for i := 0; i < tenants; i++ {
-		for c := 0; c < callsPerTenant; c++ {
+	for i := 0; i < instances; i++ {
+		for c := 0; c < callsPerInstance; c++ {
 			wg.Add(1)
-			go func(tenant int) {
+			go func(instance int) {
 				defer wg.Done()
-				handler, err := New(context.Background(), nextHandler(), configs[tenant], "bulk-redirects")
+				handler, err := New(context.Background(), nextHandler(), configs[instance], "bulk-redirects")
 				if err != nil {
-					results <- result{tenant: tenant, ok: false, detail: err.Error()}
+					results <- result{instance: instance, ok: false, detail: err.Error()}
 					return
 				}
 
 				rec := httptest.NewRecorder()
-				req := httptest.NewRequest(http.MethodGet, configs[tenant].Redirects[0].SourceURL, nil)
+				req := httptest.NewRequest(http.MethodGet, configs[instance].Redirects[0].SourceURL, nil)
 				handler.ServeHTTP(rec, req)
 
-				wantLocation := configs[tenant].Redirects[0].TargetURL
+				wantLocation := configs[instance].Redirects[0].TargetURL
 				gotLocation := rec.Header().Get("Location")
 				if rec.Code != http.StatusFound || gotLocation != wantLocation {
 					results <- result{
-						tenant: tenant,
-						ok:     false,
-						detail: fmt.Sprintf("status=%d location=%q, want status=%d location=%q", rec.Code, gotLocation, http.StatusFound, wantLocation),
+						instance: instance,
+						ok:       false,
+						detail:   fmt.Sprintf("status=%d location=%q, want status=%d location=%q", rec.Code, gotLocation, http.StatusFound, wantLocation),
 					}
 					return
 				}
 
-				results <- result{tenant: tenant, ok: true}
+				results <- result{instance: instance, ok: true}
 			}(i)
 		}
 	}
@@ -927,7 +927,7 @@ func TestConcurrentInlineTenantsDoNotCrossContaminate(t *testing.T) {
 
 	for r := range results {
 		if !r.ok {
-			t.Errorf("tenant %d got wrong redirect under concurrent load: %s", r.tenant, r.detail)
+			t.Errorf("instance %d got wrong redirect under concurrent load: %s", r.instance, r.detail)
 		}
 	}
 }
