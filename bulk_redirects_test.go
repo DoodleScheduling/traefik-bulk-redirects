@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -860,6 +861,74 @@ func TestInlineModesRemainBackwardsCompatible(t *testing.T) {
 			assertStatus(t, rec, http.StatusFound)
 			assertLocation(t, rec, config.Redirects[0].TargetURL+"?q=1")
 		})
+	}
+}
+
+// TestConcurrentInlineInstancesDoNotCrossContaminate simulates multiple
+// independent Middleware instances, each configured with their own, different
+// inline redirect list, all calling New() concurrently. inlineCache is a
+// single global slot keyed by config pointer identity and a content hash, not
+// a map keyed per instance -- this proves that sharing that single slot
+// across distinct configs never hands one instance another instance's
+// compiled redirects, even under concurrent access, though it does mean the
+// cache is only ever a hit for the single most-recently-seen config (an
+// efficiency concern, not a correctness one).
+func TestConcurrentInlineInstancesDoNotCrossContaminate(t *testing.T) {
+	resetCaches()
+
+	const instances = 20
+	const callsPerInstance = 10
+
+	configs := make([]*Config, instances)
+	for i := 0; i < instances; i++ {
+		configs[i] = testCacheConfig("instance-" + string(rune('a'+i)))
+	}
+
+	type result struct {
+		instance int
+		ok       bool
+		detail   string
+	}
+
+	results := make(chan result, instances*callsPerInstance)
+	var wg sync.WaitGroup
+	for i := 0; i < instances; i++ {
+		for c := 0; c < callsPerInstance; c++ {
+			wg.Add(1)
+			go func(instance int) {
+				defer wg.Done()
+				handler, err := New(context.Background(), nextHandler(), configs[instance], "bulk-redirects")
+				if err != nil {
+					results <- result{instance: instance, ok: false, detail: err.Error()}
+					return
+				}
+
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, configs[instance].Redirects[0].SourceURL, nil)
+				handler.ServeHTTP(rec, req)
+
+				wantLocation := configs[instance].Redirects[0].TargetURL
+				gotLocation := rec.Header().Get("Location")
+				if rec.Code != http.StatusFound || gotLocation != wantLocation {
+					results <- result{
+						instance: instance,
+						ok:       false,
+						detail:   fmt.Sprintf("status=%d location=%q, want status=%d location=%q", rec.Code, gotLocation, http.StatusFound, wantLocation),
+					}
+					return
+				}
+
+				results <- result{instance: instance, ok: true}
+			}(i)
+		}
+	}
+	wg.Wait()
+	close(results)
+
+	for r := range results {
+		if !r.ok {
+			t.Errorf("instance %d got wrong redirect under concurrent load: %s", r.instance, r.detail)
+		}
 	}
 }
 
