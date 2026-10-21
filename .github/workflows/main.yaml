@@ -24,6 +24,6 @@ jobs:
       - name: Tests
         run: make test
       - name: Send go coverage report
-        uses: shogo82148/actions-goveralls@25f5320d970fb565100cf1993ada29be1bb196a1 # v1.10.0
+        uses: shogo82148/actions-goveralls@4b30166c2ac96ac557328a27874a16b777f9b8bd # v1.11.4
         with:
           path-to-profile: coverage.out
